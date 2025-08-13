@@ -14,61 +14,16 @@ elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
 else:
     device = torch.device("cpu")
 
-# remember to move to the appropriate device!
 
+# TODO: change to use unified mha (and think, does that mean it doesn't do anything if there's no KQV matrices?)
+# TODO: implement kv caching
+# implement gradient accumulation
+# TODO: hey can you do training loop time measurement, all optimizations
+# TODO: create an inference loop.
 
-# define class here
-# first let's define an MLP
-
-# next step is gonna be creating an embedding.
-
-
-# TODO: today - let's implement positional encoding (remember the sqrt(d) factor)
-# TODO: today - remember you're also doing a system question.
-
-
-
-# TODO: finish transformers, with positional encoding. no training yet.
-# TODO: review your work, with special emphasis on what you missed.
-# TODO: do the hard-written positional encoding.
-# then do system design problem.
-
-# then get alexnet working
-# then get imdb thingy working (tokenization! use this as chance to use huggingface tokenizer).
-# then get CLIP working.
-
-# then do either performance
-# or LLM upgrades.
-
-
-
-
-# If you get tired, move to system design problem
-# TODO: start training on alexnet and imbd thingy
-# TODO: then start training on CLIP and fix it up.
-# TODO: hey can you do training loop time measurement, all optimizations, and even batch acculumation
-# TODO: do this on like Alexnet or something.
-# then come back here and implement the other stuff (ROPE, other masking, and k-v caching)
-
-# prove gradient accumulation to yourself, good thing you're looking into this!
-
-
-
-# if you're doing regression - THINK THROUGH whether you need a causal mask and all the width you havein
-# a normal transformer.
-# think of it for a classification head.
-
-# last things for transformer:
-# tying weights DONE
-# multiply by embedding dimension. DONE
-
-
-# TODO: 
-# You also need to initialize weights!
-# switch to GELU!
-
-
-
+# TODO: we should tokenize the dataset and leave it in memory mapped files like nanogpt did.
+# Of course before you tokenize decide on an SFT format.
+# Figure out what's the best way for the data to be loaded in a shuffled manner (I think the memory mapping makes that easy)
 
 
 class AttentionHead(nn.Module):
@@ -137,11 +92,13 @@ class TransformerBlock(nn.Module):
              for _ in range(num_heads)]
         )
         self.mha_linear = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.mha_linear.is_res_init_scaling_needed = True
         self.mha_dropout = nn.Dropout(dropout_rate)
 
         self.layer_norm_2 = nn.LayerNorm(embed_dim)
         self.mlp1 = nn.Linear(embed_dim, ff_dim)
         self.mlp2 = nn.Linear(ff_dim, embed_dim)
+        self.mlp2.is_res_init_scaling_needed = True
         self.ff_dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x, cos_table, sin_table):                  # x: (B, T, E)
@@ -169,6 +126,20 @@ class Transformer(nn.Module):
 		pe[:, 1::2] = torch.cos(angles)                                           # odd dims
 		# store as (1, T, E) for broadcast to batch
 		self.register_buffer("classical_positional_encoding", pe.unsqueeze(0), persistent=False)
+		
+
+	def init_weights(self, module):
+		# linear layers get init to std 0.02, but biases get init to 0.0
+		# this function is inspired by the nanogpt implementation
+		if isinstance(module, nn.Linear):
+			std = 0.02
+			if hasattr(module, is_res_init_scaling_needed):
+				std = std * ((2 * self.n_blocks) ** -0.5)
+			torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+			if module.bias is not None:
+				torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 	def prepare_rope_posemb(self, context_len, attn_head_dim):
 		pos = torch.arange(context_len, dtype=torch.float32) # (T,)
@@ -206,6 +177,7 @@ class Transformer(nn.Module):
 
 		# tie weights of embedding layer and output layer
 		self.output.weight = self.embedding.weight
+		self.apply(self.init_weights)
 
 	def forward(self, x):
 		# x has length B, T
@@ -257,12 +229,13 @@ def transformer_loss(logits,labels,pad_token_id):
 def main():
 	config = {
 		"weight_decay": 0.1,
-		"learning_rate": 0.001,
-		"neuron_size": 200
+		"learning_rate": 0.001
 	}
 
 
-	batch_size = 16
+	batch_accum_size = 32
+	batch_total_size = 512
+
 	num_epochs = 3
 
 
@@ -286,7 +259,7 @@ def main():
 	# define dataloader here
 	print(f'Training set has shape {training_set[0][0].shape}')
 
-	with wandb.init(config=config,project="mnist-playground",entity="alancasallas-self") as run:
+	with wandb.init(config=config,project="casallm",entity="alancasallas-self") as run:
 
 		model = MLP(wandb.config.neuron_size)
 		model.to(device)
@@ -296,6 +269,8 @@ def main():
 		# let's try Adam for now with default parameters
 		optimizer = torch.optim.AdamW(model.parameters(),lr=wandb.config.learning_rate,betas=(0.9, 0.999), eps=1e-08, weight_decay=wandb.config.weight_decay)
 		
+
+		# for something that takes this long, you'll definetly want to print or even validation after every few steps, not just epochs.
 
 		for epoch in range(num_epochs):
 			metrics = {"epoch": epoch}
