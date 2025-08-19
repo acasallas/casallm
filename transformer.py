@@ -15,85 +15,81 @@ else:
     device = torch.device("cpu")
 
 
-# TODO: change to use unified mha (and think, does that mean it doesn't do anything if there's no KQV matrices?)
-# TODO: implement kv caching
-# implement gradient accumulation
-# TODO: hey can you do training loop time measurement, all optimizations
-# TODO: create an inference loop.
-
-# TODO: we should tokenize the dataset and leave it in memory mapped files like nanogpt did.
-# Of course before you tokenize decide on an SFT format.
-# Figure out what's the best way for the data to be loaded in a shuffled manner (I think the memory mapping makes that easy)
-
-
-class AttentionHead(nn.Module):
-    def __init__(self, embed_dim, head_dim, dropout_rate, context_len, pad_token_id):
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id):
         super().__init__()
-        self.head_dim = head_dim
-        self.W_Q = nn.Linear(embed_dim, head_dim, bias=False)
-        self.W_K = nn.Linear(embed_dim, head_dim, bias=False)
-        self.W_V = nn.Linear(embed_dim, head_dim, bias=False)
-        self.attn_drop = nn.Dropout(dropout_rate)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim//num_heads
+        self.QKV_proj = nn.Linear(embed_dim, embed_dim*3, bias=False)
+
+        self.attn_head_dropout_rate = dropout_rate
         self.pad_token_id = pad_token_id
 
         # cache a boolean causal mask up to context_len
         causal = torch.tril(torch.ones(context_len, context_len, dtype=torch.bool))
-        self.register_buffer("causal_mask", causal)
+        self.register_buffer("causal_mask", causal, persistent=False)
+
+        self.mha_dropout = nn.Dropout(dropout_rate)
+        self.mh_linear = nn.Linear(embed_dim, embed_dim)
+        self.mh_linear.is_res_init_scaling_needed = True # this is a flag for initialization to do special scaling.
+
+    def apply_rope_(self, x, cos, sin):
+        # split into even and odd dims. They are split into B,nh,T,head_dim//2
+        x1 = x[..., ::2] # (B,nh,T,Dh/2) each
+        x2 = x[..., 1::2]
+	    # creates a list of tensors giving the even and odd dimensions, then calls flatten(-2) to interleave them to the desired structure.
+        # resulting dim: (B,nh,T,Dh)
+        x_rot = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
+        return x_rot
+
 
     def forward(self, x, input_ids, cos_table, sin_table):
     	#input_ids (B, T)
-        B, T, _ = x.shape
-        q = self.W_Q(x)
-        k = self.W_K(x)
-        v = self.W_V(x)
+        B, T, embed_dim = x.shape
+
+        qkv = self.QKV_proj(x) # shape B,T,embed_dim*3 (this is qkv combined for all heads)
+        q,k,v = qkv.split(self.embed_dim,dim=-1)
+        # create a number_of_heads dim and move it to the front (because attention needs last two dim to be T and head_dim)
+        q = q.view(B,T,self.num_heads,self.head_dim).transpose(1,2)
+        k = k.view(B,T,self.num_heads,self.head_dim).transpose(1,2)
+        v = v.view(B,T,self.num_heads,self.head_dim).transpose(1,2)
+
+        # ensure causal mask covers T
+        if T > self.causal_mask.size(0):
+            raise ValueError(f"sequence length {T} exceeds cached context_len {self.causal_mask.size(0)}")
 
         assert self.head_dim % 2 == 0
 
-	    # ensure broadcast shapes; for (B,T,Dh) use (T,1) broadcasting on last axis pairs
-	    # make cos/sin rank-3 so they broadcast across batch (and heads if present)
-		cos = cos_table[:T, :self.head_dim//2].unsqueeze(0)  # (1,T,Dh/2)
-	    sin = sin_table[:T, :self.head_dim//2].unsqueeze(0)  # (1,T,Dh/2)
+        # unsqueeze twice into: (1, 1, T, Dh/2)
+        cos = cos_table[:T, :Dh//2].to(x.device, x.dtype).unsqueeze(0).unsqueeze(0)
+        sin = sin_table[:T, :Dh//2].to(x.device, x.dtype).unsqueeze(0).unsqueeze(0)
+	    
+        # apply RoPE to Q and K
+        q = self.apply_rope_(q, cos, sin) # (B, H, T, Dh)
+        k = self.apply_rope_(k, cos, sin) # (B, H, T, Dh)
 
-	    # split into even and odd dims. They are split into B,T,head_dim//2
-	    q1, q2 = q[..., ::2], q[..., 1::2]        # (B,T,Dh/2) each
-	    k1, k2 = k[..., ::2], k[..., 1::2]
+        causal_mask = self.causal_mask[:T, :T].to(x.device).unsqueeze(0).unsqueeze(0)  # causal: (1, 1, T, T)
+        # we only mask keys. queries be masked later, in the loss (otherwise we'll have softmaxes with denominator of 0).
+        key_keep = (input_ids != self.pad_token_id).unsqueeze(1).unsqueeze(2) # key padding: (B, 1, 1, T)
+        attn_mask = causal_mask & key_valid # (B, 1, T, T)
 
-	    # this intially creates a list of tensors giving the even and odd dimensions.
-        # it then stacks them (without combining them, there is an extra dim)
-        # then it calls flatten(-2) to interleave them to the desired structure.
-	    q_rot = torch.stack([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1).flatten(-2)
-	    k_rot = torch.stack([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1).flatten(-2)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.attn_head_dropout_rate if self.training else 0, is_causal=False)
 
+        y = y.transpose(1, 2).contiguous().view(B, T, embed_dim) # (B,nh,T,d_h) -> (B,T,embed_dim) effectivley concatenating the heads
 
-		scores = (q_rot @ k_rot.transpose(-2, -1)) * (self.head_dim ** -0.5)  # (B,T,T)
-
-        # slice to current T
-        causal_mask = self.causal_mask[:T, :T].unsqueeze(0).to(scores.device)  # (1,T, T)
-        key_valid = (input_ids != self.pad_token_id).unsqueeze(1) # (B,1,T)
-        # we intentionally don't pad queries, they'll be masked later in the loss (otherwise we'll have softmaxes with denominator of 0).
-        #query_valid = (input_ids != self.pad_token_id).unsqueeze(-1)  # [B, T, 1]
-        keep = causal_mask & key_valid
-        scores = scores.masked_fill(~keep, float("-inf"))
-        attn = torch.softmax(scores, dim=-1)
-        attn = self.attn_drop(attn)
-        return attn @ v
+        return self.mha_dropout(self.mha_linear(y))
 		
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, ff_dim, dropout_rate, context_len):
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout_rate, context_len, pad_token_id):
         super().__init__()
         assert embed_dim % num_heads == 0
         head_dim = embed_dim // num_heads
 
         self.layer_norm_1 = nn.LayerNorm(embed_dim)
-        self.attention_heads = nn.ModuleList(
-            [AttentionHead(embed_dim, head_dim, dropout_rate, context_len)
-             for _ in range(num_heads)]
-        )
-        self.mha_linear = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.mha_linear.is_res_init_scaling_needed = True
-        self.mha_dropout = nn.Dropout(dropout_rate)
+        self.mha = MultiHeadAttention(embed_dim, num_heads, dropout_rate, context_len, pad_token_id)
 
         self.layer_norm_2 = nn.LayerNorm(embed_dim)
         self.mlp1 = nn.Linear(embed_dim, ff_dim)
@@ -104,8 +100,7 @@ class TransformerBlock(nn.Module):
     def forward(self, x, cos_table, sin_table):                  # x: (B, T, E)
         # MHA (pre-norm)
         ln_x = self.layer_norm_1(x)
-        concat = torch.cat([h(ln_x, cos_table, sin_table) for h in self.attention_heads], dim=-1)  # (B, T, E)
-        x = x + self.mha_dropout(self.mha_linear(concat))
+        x = x + self.mha(ln_x)
 
         # FFN (pre-norm)
         ln_x = self.layer_norm_2(x)
@@ -114,6 +109,32 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
+	def __init__(self, vocab_size, embed_dim, context_len, num_heads, dropout_rate, n_blocks):
+		super().__init__()
+		# two embedding layers? 
+		self.embed_dim = embed_dim
+		self.embedding = nn.Embedding(vocab_size, embed_dim)
+
+
+        # cache a boolean causal mask up to context_len
+
+        self.prepare_rope_posemb(context_len, embed_dim//num_heads)
+
+
+		self.learned_pos_enc = nn.Embedding(context_len,embed_dim)
+
+		self.emb_dropout = nn.Dropout(dropout_rate)
+		ff_dim = embed_dim*4
+		self.transformer_blocks = nn.Sequential(*[
+			TransformerBlock(embed_dim, num_heads, ff_dim, dropout_rate, context_len) for _ in range(n_blocks)
+			])
+		self.output_layernorm = nn.LayerNorm(embed_dim)
+		self.output = nn.Linear(embed_dim, vocab_size, bias=False)
+
+		# tie weights of embedding layer and output layer
+		self.output.weight = self.embedding.weight
+		self.apply(self.init_weights)
+
 	def prepare_classical_posemb(self, context_len, embed_dim):
         # prepare classical positional encoding
         # TODO: move to its own function?
@@ -152,33 +173,6 @@ class Transformer(nn.Module):
 		self.register_buffer("rope_cosines", pe.unsqueeze(0), persistent=False)
 		self.register_buffer("rope_sines", pe.unsqueeze(0), persistent=False)
 
-
-	def __init__(self, vocab_size, embed_dim, context_len, num_heads, dropout_rate, n_blocks):
-		super().__init__()
-		# two embedding layers? 
-		self.embed_dim = embed_dim
-		self.embedding = nn.Embedding(vocab_size, embed_dim)
-
-
-        # cache a boolean causal mask up to context_len
-
-        self.prepare_rope_posemb(context_len, embed_dim//num_heads)
-
-
-		self.learned_pos_enc = nn.Embedding(context_len,embed_dim)
-
-		self.emb_dropout = nn.Dropout(dropout_rate)
-		ff_dim = embed_dim*4
-		self.transformer_blocks = nn.Sequential(*[
-			TransformerBlock(embed_dim, num_heads, ff_dim, dropout_rate, context_len) for _ in range(n_blocks)
-			])
-		self.output_layernorm = nn.LayerNorm(embed_dim)
-		self.output = nn.Linear(embed_dim, vocab_size, bias=False)
-
-		# tie weights of embedding layer and output layer
-		self.output.weight = self.embedding.weight
-		self.apply(self.init_weights)
-
 	def forward(self, x):
 		# x has length B, T
 		T = x.shape[1]
@@ -209,11 +203,9 @@ class Transformer(nn.Module):
 		return self.output(self.output_layernorm(x)) # outputting logits - B,T,vocab_size
 
 
-# Now let's do positional encoding. DONE.
-# Then let's do the masking that would be needed for SFT. DONE
-# Then, let's do ROPE embeddings. DONE
 
-# Lastly, do k-v caching. Then I thhink you're done but might wanna go through todo list.
+# for tf32. TODO: does our use of BF16 override this?
+torch.set_float32_matmul_precision('high')
 
 
 # TODO: what should you do about gradient accumulation here?
