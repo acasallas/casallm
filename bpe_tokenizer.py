@@ -64,6 +64,8 @@ def main():
     os.makedirs("clip_bpe", exist_ok=True)
     tokenizer.save("clip_bpe/tokenizer.json")
 
+    raise ValueError("Remember to save the special hugging face tokenizer as well!")
+
 
 if __name__ == "__main__":
     main()

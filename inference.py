@@ -16,14 +16,22 @@ else:
     device = torch.device("cpu")
 
 
+# TODO: load tokenizer
+
+
 def run_inference():
 	# load model
-	
+
 
 
 	while True:
 		# run inference forever
 		new_batch = input("Give me a new batch of data")
+
+		# tokenize batch of data
+		# feed into LLM and get result
+		# first do all at a time, then stream tokens back.
+
 		pass
 
 

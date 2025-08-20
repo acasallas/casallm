@@ -16,14 +16,6 @@ import wandb
 # you're gonna choose formats for all of them.
 
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
-
-
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id):
@@ -93,7 +85,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, ff_dim, dropout_rate, context_len, pad_token_id):
+    def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id):
         super().__init__()
         assert embed_dim % num_heads == 0
         head_dim = embed_dim // num_heads
@@ -102,39 +94,37 @@ class TransformerBlock(nn.Module):
         self.mha = MultiHeadAttention(embed_dim, num_heads, dropout_rate, context_len, pad_token_id)
 
         self.layer_norm_2 = nn.LayerNorm(embed_dim)
-        self.mlp1 = nn.Linear(embed_dim, ff_dim)
+        self.mlp1 = nn.Linear(embed_dim, embed_dim*4)
         self.mlp2 = nn.Linear(ff_dim, embed_dim)
         self.mlp2.is_res_init_scaling_needed = True
         self.ff_dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, x, cos_table, sin_table):                  # x: (B, T, E)
-        # MHA (pre-norm)
+    def forward(self, x, input_ids, cos_table, sin_table):
+        # MHA 
         ln_x = self.layer_norm_1(x)
-        x = x + self.mha(ln_x)
+        x = x + self.mha(ln_x, input_ids, cos_table, sin_table)
 
-        # FFN (pre-norm)
+        # FFN
         ln_x = self.layer_norm_2(x)
         x = x + self.ff_dropout(self.mlp2(F.gelu(self.mlp1(ln_x))))
         return x
 
 
 class Transformer(nn.Module):
-	def __init__(self, vocab_size, embed_dim, context_len, num_heads, dropout_rate, n_blocks):
+	def __init__(self, vocab_size, embed_dim, context_len, num_heads, dropout_rate, n_blocks, pad_token_id):
 		super().__init__()
-		# two embedding layers? 
 		self.embed_dim = embed_dim
 		self.embedding = nn.Embedding(vocab_size, embed_dim)
-
 
         # cache a boolean causal mask up to context_len
         self.prepare_rope_posemb(context_len, embed_dim//num_heads)
 
-		self.learned_pos_enc = nn.Embedding(context_len,embed_dim)
+		#self.learned_pos_enc = nn.Embedding(context_len,embed_dim)
 
 		self.emb_dropout = nn.Dropout(dropout_rate)
-		ff_dim = embed_dim*4
+		
 		self.transformer_blocks = nn.Sequential(*[
-			TransformerBlock(embed_dim, num_heads, ff_dim, dropout_rate, context_len) for _ in range(n_blocks)
+			TransformerBlock(embed_dim, num_heads, dropout_rate, context_len, pad_token_id) for _ in range(n_blocks)
 			])
 		self.output_layernorm = nn.LayerNorm(embed_dim)
 		self.output = nn.Linear(embed_dim, vocab_size, bias=False)
@@ -181,14 +171,14 @@ class Transformer(nn.Module):
 		self.register_buffer("rope_cosines", pe.unsqueeze(0), persistent=False)
 		self.register_buffer("rope_sines", pe.unsqueeze(0), persistent=False)
 
-	def forward(self, x):
+	def forward(self, input_ids):
 		# x has length B, T
 		T = x.shape[1]
 
         if T > self.context_len:
             raise ValueError(f"seq len {T} exceeds context_len {self.context_len}")
 
-		x = self.embedding(x)*(self.embed_dim ** -0.5) # B,T,E
+		x = self.embedding(input_ids)*(self.embed_dim ** -0.5) # B,T,E
 
 		# TODO: consider putting the to inside the attention head to use same dtype as q,k.
 		cos = self.rope_cosines[:T].to(torch.get_default_dtype())  # (T, Dh/2)
@@ -205,7 +195,7 @@ class Transformer(nn.Module):
 
         x = self.emb_dropout(x)
         for blk in self.transformer_blocks:
-        	x = blk(x, cos, sin)
+        	x = blk(x, input_ids, cos, sin)
 
 		x = self.transformer_blocks(x) # B,T,E
 		return self.output(self.output_layernorm(x)) # outputting logits - B,T,vocab_size

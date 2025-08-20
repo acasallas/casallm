@@ -60,7 +60,7 @@ def main():
 	# define dataloader here
 	print(f'Training set has shape {training_set[0][0].shape}')
 
-	with wandb.init(config=config,project="casallm-pretraining",entity="alancasallas-self") as run:
+	with wandb.init(config=config,project="casallm-sft",entity="alancasallas-self") as run:
 
 		model = Transformer(wandb.config.neuron_size)
 		model.to(device)
@@ -68,6 +68,7 @@ def main():
 		# todo: can you implement batch accumulation?
 
 		# let's try Adam for now with default parameters
+		# TODO: we may just have a linear decay instead of the whole cosine annearling thing.s
 		optimizer = torch.optim.AdamW(model.parameters(),lr=wandb.config.learning_rate,betas=(0.9, 0.999), eps=1e-08, weight_decay=wandb.config.weight_decay)
 		
 
@@ -88,7 +89,7 @@ def main():
 				optimizer.zero_grad()
 
 				outputs = model(inputs) # outputs are logits (B,T,vocab_size)
-				loss = transformer_loss(outputs,labels) # labels are B,T
+				loss = transformer_loss(outputs,labels, 0) # labels are B,T
 
 				train_losses += loss.item()*inputs.size(0)
 				train_total += inputs.size(0)
