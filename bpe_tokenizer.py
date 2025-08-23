@@ -4,68 +4,82 @@ from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.processors import TemplateProcessing
 from transformers import PreTrainedTokenizerFast
 
-
-# TODO: explore the finewebedu dataset
-# TODO: can you see if you need to add a token when a dataset ends
-# TODO: and of course the whole reason we are doing this - special tokens for prompts!
-
+# export TOKENIZERS_PARALLELISM=true
 
 SEED = 42
-VOCAB_SIZE = 25_000
+SPECIAL_TOKENS = ["<s>", "</s>", "<pad>", "<|system|>", "<|user|>", "<|assistant|>"]
+VOCAB_SIZE = 40_960  # includes special tokens
+JOIN_BATCH = 20_000
 
 def main():
-    ds = load_dataset("pixparse/cc3m-wds", split="train")
-    ds = ds.shuffle(seed=SEED)  # avoid head-of-corpus bias
+    remote_name = "sample-10BT"
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
+
+    # drop extra columns to help Arrow -> Python work.
+    text_col = "text"
+    drop_cols = [c for c in ds.column_names if c != text_col]
+    if drop_cols:
+        ds = ds.remove_columns(drop_cols)
     n = ds.num_rows
 
-    # Be tolerant to different column names
-    candidates = ["txt", "caption", "text", "description"]
-    text_col = next((c for c in candidates if c in ds.column_names), None)
-    if text_col is None:
-        raise ValueError(f"Couldn't find a text column in: {ds.column_names}")
-
-    def batch_iterator(batch_size=1000):
+    def big_chunk_iterator(batch_size=JOIN_BATCH):
         batch = []
+        append = batch.append
+        join = "\n".join
         for ex in ds:
-            t = ex[text_col]
+            t = ex.get(text_col)
             if t:
-                batch.append(t)
+                append(t)
             if len(batch) >= batch_size:
-                yield batch
-                batch = []
+                yield join(batch)
+                batch.clear()
         if batch:
-            yield batch
+            yield join(batch)
 
-    # Model + pretokenizer
-    tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+    tokenizer = Tokenizer(BPE(unk_token=None))  # byte-level BPE => no <unk>
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
+    tokenizer.decoder = ByteLevelDecoder()
 
     trainer = BpeTrainer(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,           # total size INCLUDING specials
         min_frequency=2,
-        special_tokens=["[PAD]", "[EOS]", "[UNK]"],
+        special_tokens=SPECIAL_TOKENS,
         initial_alphabet=ByteLevel.alphabet(),
-        show_progress=True
+        show_progress=True,
     )
 
     print("Starting BPE training…")
-    tokenizer.train_from_iterator(batch_iterator(), trainer=trainer, length=n)
+    # no `length=` -> avoids progress bookkeeping cost & mismatches
+    tokenizer.train_from_iterator(big_chunk_iterator(), trainer=trainer, length=n // JOIN_BATCH)
 
-    # Now IDs exist → add post-processing
-    eos_id = tokenizer.token_to_id("[EOS]")
+    # BOS/EOS via post-processor
+    bos_id = tokenizer.token_to_id("<s>")
+    eos_id = tokenizer.token_to_id("</s>")
     tokenizer.post_processor = TemplateProcessing(
-        single="$A [EOS]",
-        special_tokens=[("[EOS]", eos_id)],
+        single="<s>$A</s>",
+        pair="<s>$A</s> <s>$B</s>",
+        special_tokens=[("<s>", bos_id), ("</s>", eos_id)],
     )
 
-    os.makedirs("clip_bpe", exist_ok=True)
-    tokenizer.save("clip_bpe/tokenizer.json")
+    os.makedirs("casallm_bpe", exist_ok=True)
+    tokenizer.save("casallm_bpe/tokenizer.json")
 
-    raise ValueError("Remember to save the special hugging face tokenizer as well!")
-
+    hf_tok = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        bos_token="<s>",
+        eos_token="</s>",
+        pad_token="<pad>",
+        additional_special_tokens=["<|system|>", "<|user|>", "<|assistant|>"],
+        model_max_length=1024,
+        padding_side="right",
+        truncation_side="right",
+    )
+    hf_tok.save_pretrained("casallm_bpe")
+    print("Saved to ./casallm_bpe")
 
 if __name__ == "__main__":
     main()

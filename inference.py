@@ -18,6 +18,8 @@ else:
 
 # TODO: load tokenizer
 
+# TODO: put temperature in here. What about top-p and top-k?
+
 
 def run_inference():
 	# load model

@@ -94,6 +94,8 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
         training_set = None # this is going to be a tokenized version of the dataset
         validation_set = None # this is going to be a tokenized version of the dataset.
 
+        # TODO: we need a loader that will create inputs and labels, where labels will be inputs shifted by one.
+
         # Create data loaders for our datasets; shuffle for training, not for validation
         training_loader = torch.utils.data.DataLoader(training_set, batch_size=batch_size, shuffle=True,drop_last=True)
         validation_loader = torch.utils.data.DataLoader(validation_set, batch_size=batch_size, shuffle=False)
