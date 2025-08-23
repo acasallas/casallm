@@ -9,21 +9,14 @@ import wandb
 from common_utils import save_checkpoint, load_checkpoint
 from transformer import Transformer
 
+from lmdataset import IndexedLMDataset
 
+# step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
 # step 3: use torchsummary to figure out transformer size first.
-# step 4: let's figure out hyperparams
+# step 4: let's figure out hyperparams (first look it up, then double check what Andrej was using)
 # step 5: your inference.py may just want to print out one inference at a time first.
 # step 6: hey before you kick off large scale training, overfit one batch.
-
-# TODO: for SFT I think loss mask is not the same as pad_id != 0, figure out how that works.
-
-# WSL2 will be a good thing to set up in a few minutes.
-
-# first have chatgpt give you hyperparameter settings, then look at Andrej's hyperparameter settings
-
-# when the PC frees up, you can start analyzing the data and then start tokenizing everything.
-# (you'd figure out a prompt template and determine if DPO requires any more tokenization considerations.)
-
+# step 7: figure out tokens/sec training.
 
 
 if torch.cuda.is_available():
@@ -38,12 +31,10 @@ PAD_TOKEN = 0
 # use NVIDIA's tf32.
 torch.set_float32_matmul_precision('high')
 
-# TODO: do you need to take gradient accumulation into account here?
+
 def transformer_loss(logits,labels,pad_token_id):
-    loss_mask = (labels != pad_token_id).float() # (B,T)
     # collapse logits and labels from (B,T,..) to (B*T,...) so they can be passed into cross_entropy function.
-    unreduced_loss = F.cross_entropy(logits.view(-1,logits.size(-1)), labels.view(-1), reduction="none").view(B,T)
-    return (unreduced_loss * loss_mask).sum()/loss_mask.sum() # average over only non-padded losses.
+    return F.cross_entropy(logits.view(-1,logits.size(-1)), labels.view(-1)).view(B,T)
 
 def resolve_run_name(run_name, resume_name):
     """
@@ -91,8 +82,8 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
     print_every_steps = 100
 
     with wandb.init(mode="disabled",config=config,project="casallm-pretraining",entity="alancasallas-self",name=run_name) as run:
-        training_set = None # this is going to be a tokenized version of the dataset
-        validation_set = None # this is going to be a tokenized version of the dataset.
+        training_set = IndexedLMDataset(token_path, index_path, dtype=np.uint32) # TODO: are we setting this to 16 b/c vocab size is 40,000???
+        validation_set = IndexedLMDataset(token_path, index_path, dtype=np.uint32) # TODO: same as above
 
         # TODO: we need a loader that will create inputs and labels, where labels will be inputs shifted by one.
 
@@ -148,7 +139,7 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
                 # TODO: can we get bf16 in here?
 
                 outputs = model(inputs) # outputs are logits (B,T,vocab_size)
-                loss = transformer_loss(outputs, labels, PAD_TOKEN)/gradient_accum_steps # labels are B,T
+                loss = transformer_loss(outputs, labels)/gradient_accum_steps # labels are B,T
 
                 B = inputs.size(0)
                 train_loss += loss.item()*B
@@ -192,7 +183,7 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
                             outputs = model(inputs)
                             B = inputs.size(0)
                             _, predicted = torch.max(outputs, 1)
-                            loss = transformer_loss(outputs, labels, PAD_TOKEN)
+                            loss = transformer_loss(outputs, labels)
                             val_losses += loss.item()*B
                             val_correct += (labels==predicted).sum().item()
                             val_total += B
@@ -207,9 +198,8 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
 
 
 if __name__ == "__main__":
-    # Create an ArgumentParser object
     parser = argparse.ArgumentParser(description="A simple command-line program.")
-    parser.add_argument("run-name", type=str, help="wandb run name")
+    parser.add_argument("run_name", type=str, help="wandb run name")
     parser.add_argument("--resume-name", type=str, help="wandb run to resume name")
     parser.add_argument("--resume-checkpoint", type=str, help="wandb run to resume name")
     args = parser.parse_args()

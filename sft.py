@@ -20,14 +20,13 @@ else:
 torch.set_float32_matmul_precision('high')
 
 
-# TODO: what should you do about gradient accumulation here?
+# TODO: a big thing is setting up loss mask for everything but <|assistant|>. (seems like we might do that in preprocessing)
 def transformer_loss(logits,labels,pad_token_id):
-	loss_mask = (labels != pad_token_id).float() # (B,T)
-	# collapse logits from (B,T,vocab_size) to (B*T,vocab_size) and collapse labels from (B,T) to (B*T)
-	# this is done to be able to use the cross_entropy function
-	# then we return the shape to B,T
-	unreduced_loss = F.cross_entropy(logits.view(-1,logits.size(-1)), labels.view(-1), reduction="none").view(B,T)
-	return (unreduced_loss * loss_mask).sum()/loss_mask.sum() # average over only non-padded losses.
+    # during pre-training, we will NOT have any padding.
+    loss_mask = (labels != pad_token_id).float() # (B,T)
+    # collapse logits and labels from (B,T,..) to (B*T,...) so they can be passed into cross_entropy function.
+    unreduced_loss = F.cross_entropy(logits.view(-1,logits.size(-1)), labels.view(-1), reduction="none").view(B,T)
+    return (unreduced_loss * loss_mask).sum()/loss_mask.sum() # average over only non-padded losses.
 
 # gradient accumulation
 
