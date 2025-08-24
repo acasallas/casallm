@@ -30,6 +30,10 @@ def transformer_loss(logits,labels,pad_token_id):
 
 # gradient accumulation
 
+# NOTE: you were told to have 0.0 dropout in SFT (unlike pretraining where it was 0.1)
+
+# TODO: I think you might be able to merge pretraining and sft into one file.
+
 
 def main():
 	config = {

@@ -11,12 +11,17 @@ from transformer import Transformer
 
 from lmdataset import IndexedLMDataset
 
+# step 0 - see if anything is missing here.
+# step 1 - if not, finish this script to completion.
+# step 1.5 - finish the sft stuff to completion.
+
 # step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
 # step 3: use torchsummary to figure out transformer size first.
 # step 4: let's figure out hyperparams (first look it up, then double check what Andrej was using)
 # step 5: your inference.py may just want to print out one inference at a time first.
 # step 6: hey before you kick off large scale training, overfit one batch.
 # step 7: figure out tokens/sec training.
+# step 8: get torch compile in here.
 
 
 if torch.cuda.is_available():
@@ -136,7 +141,7 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
 
                 optimizer.zero_grad()
 
-                # TODO: can we get bf16 in here?
+                # TODO: get bf 16 in here.
 
                 outputs = model(inputs) # outputs are logits (B,T,vocab_size)
                 loss = transformer_loss(outputs, labels)/gradient_accum_steps # labels are B,T
