@@ -3,8 +3,14 @@ from datasets import load_dataset
 
 # Reminder: we're gonna use both sft and gen splits in the ultrachat dataset for sft.
 
+
+# TODO: detokenize all datasets when you load them to make sure they look good and have the right format going in.
+
 # TODO: let's analyze the ultrachat_200k dataset
 # does it have "who are you" type questions. If not inject them and say you are CasaLLM.
+
+
+# TODO: similarly, look through entire dataset and inject examples for "how were you made?" and "what are you?", "who made you", "why were you made."
 
 # Some things to inject into SFT:
 # system prompts
@@ -17,6 +23,8 @@ from datasets import load_dataset
 # TODO: still gotta filter the DPO dataset.
 # System design - check responses being served for ultra bad things like CSAM.
 
+# TODO: put in some responses to gibberish or non-English language (I don't understand your input, can you write it in English?)
+# be careful with the above but I think it should be fine.
 
 # TODO: let's see if a left truncate is necessary. If it's not we can remove left truncate code from lmdataset.py
 # and he put left truncate in two places!
@@ -42,10 +50,6 @@ I think none but double check just to be sure.
 # the test_gen dataset:
 # None!
 """
-
-
-
-
 
 system_prompts = [
 "You are a helpful AI assistant. Give answers that are helpful and detailed.",

@@ -24,11 +24,6 @@ def forward(self, x, *, past_kv=None, use_cache=False, **kw):
         return self._forward_prefill(x, **kw)  # normal training path
 """
 
-# before kv caching, let's make sure our Transformer looks spot on.
-# then choose a template and agree on a tokenization scheme. tokenizing tonight would be good.
-# then do kv caching (maybe a little bit of inference).
-# ooh! in inference.py, what about you try to batch together without kv caching?
-
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id):

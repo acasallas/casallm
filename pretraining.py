@@ -2,6 +2,7 @@ import argparse
 import os
 import math
 import inspect
+import time
 
 import numpy as np
 import torch
@@ -18,14 +19,17 @@ from lmdataset import IndexedLMDataset
 
 
 """
-# so finish the synchronize and printing every few steps.
-# then do hyperparameters below
+# Do SFT and DPO now.
+# even inference if you want to.
+# and if you wanna go reaaaally crazy, code up the server and the UI lololol.
 
 
 Now it's time to start thinking hyperparameters.
 Come up with some then run them by chatgpt.
 First, let's try context_len 1024.
 Then, let's do the same for context_len 2048.
+
+# once we size transformer in VRAM, we should be able to make a good guess for our context_len
 
 Karpathy used these settings:
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
@@ -52,6 +56,40 @@ All models were trained for a total of 300 billion tokens --> but remember you h
 # step 5: your inference.py may just want to print out one inference at a time first.
 # step 6: hey before you kick off large scale training, overfit one batch.
 # step 8: get torch compile in here.
+# step 9: a random seed will help you if you have to restart training.
+
+# later recommendation: Consider gradient checkpointing inside blocks if you push context length or model size.
+
+
+"""
+Potential DataLoader settings to play around with:
+
+train_loader = DataLoader(
+    train_set,
+    batch_size=C.batch_micro_size,
+    shuffle=True,
+    drop_last=True,
+    num_workers=12,                 # start ~12–16; tune
+    prefetch_factor=4,              # default=2; bump if RAM allows
+    pin_memory=True,
+    pin_memory_device="cuda",       # PyTorch ≥2.1
+    persistent_workers=True,
+    multiprocessing_context="fork", # Linux/WSL; try "forkserver" if RAM spikes
+    worker_init_fn=lambda _: torch.set_num_threads(1),  # avoid BLAS thread storms
+)
+
+val_loader = DataLoader(
+    val_set,
+    batch_size=C.batch_micro_size,
+    shuffle=False,
+    num_workers=2,                  # small; eval is bursty
+    prefetch_factor=2,
+    pin_memory=True,
+    pin_memory_device="cuda",
+    persistent_workers=True,
+    worker_init_fn=lambda _: torch.set_num_threads(1),
+)
+"""
 
 
 if torch.cuda.is_available():
@@ -62,10 +100,13 @@ else:
     device = torch.device("cpu")
 
 PAD_TOKEN = 0
+IGNORE_TOKEN = -100 # token that loss functions will ignore
+STAGE_PRETRAINING = "pretraining"
+STAGE_SFT = "sft"
+STAGE_DPO = "dpo"
 
 # use NVIDIA's tf32.
 torch.set_float32_matmul_precision('high')
-
 
 def param_groups(model, wd=0.1):
     """
@@ -87,7 +128,8 @@ def param_groups(model, wd=0.1):
 
 def model_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """
-    Cross-entropy over all tokens (no PADs expected).
+    Cross-entropy over all tokens
+    Note: expect no PAD tokens. (pretraining will not have PAD tokens, and SFT will have IGNORE TOKENS instead).
     logits: (B,T,V), labels: (B,T) -> mean over B*T tokens.
     """
     B, T, V = logits.shape
@@ -95,6 +137,7 @@ def model_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         logits.view(B * T, V),
         labels.view(B * T),
         reduction="mean",
+        ignore_index = IGNORE_TOKEN
     )
 
 @torch.no_grad()
@@ -124,29 +167,62 @@ def resolve_run_name(run_name, resume_name):
             print(f"Creating directory for {run_name}.")
             return run_name, save_dir
 
-def main(run_name: str, resume_name: str, resume_checkpoint: str):
-    train_token_path = ""
-    train_index_path = ""
-    val_token_path = ""
-    val_index_path = ""
-    tokenizer_dir = ""
-    # assert you set these
-    assert train_token_path and train_index_path and val_token_path and val_index_path and tokenizer_dir
-
-    config = {
+def get_config_for_training_stage(training_stage):
+    if training_stage == STAGE_PRETRAINING:
+        return {
         "weight_decay": 0.1,
-        "learning_rate": 0.001,
-        "batch_micro_size": 256,
-        "batch_effective_size": 1024,
+        "learning_rate": 3e-4,
+        "min_lr": 1e-4, # TODO: you need to tune this
+        "batch_micro_size": 64, # tune this until you max out VRAM.
+        "batch_effective_size": 512, #2**19 tokens
         "num_epochs": 1,
-        "num_blocks": 6,
+        "num_blocks": 24,
         "dropout_rate": 0.1,
-        "embed_dim": 512,
-        "context_len": 1024,
-        "num_heads": 4,
-        "warmup_steps": 1000 # TODO: tune this
+        "embed_dim": 1024,
+        "context_len": 1024, # if we can get to 2048 that will be preferrable
+        "num_heads": 16,
+        "warmup_steps": 1000 # TODO: tune this, (I think it's 2% of total steps?)
     }
+    elif training_stage == STAGE_SFT:
+        return {
+        "weight_decay": 0.1,
+        "learning_rate": 3e-4,
+        "min_lr": 1e-4, # TODO: you need to tune this
+        "batch_micro_size": 64, # tune this until you max out VRAM.
+        "batch_effective_size": 512, #2**19 tokens
+        "num_epochs": 1,
+        "num_blocks": 24,
+        "dropout_rate": 0.0,
+        "embed_dim": 1024,
+        "context_len": 1024, # if we can get to 2048 that will be preferrable
+        "num_heads": 16,
+        "warmup_steps": 1000 # TODO: tune this, (I think it's 2% of total steps?)
+    }
+    raise ValueError(f"bad training stage {training_stage}")
 
+def get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, context_len, token_dtype):
+    if training_stage == STAGE_PRETRAINING:
+        # TODO: need to turn train_data_dir into train_token_path
+        training_set = IndexedLMDataset(train_token_path, train_index_path, token_dtype)
+        validation_set = IndexedLMDataset(val_token_path, val_index_path, token_dtype)
+        return training_set, validation_set
+    elif training_stage == STAGE_SFT:
+        training_set = SFTMemmapDatasetShifted(train_data_dir, context_len, PAD_TOKEN, IGNORE_TOKEN, token_dtype)
+        validation_set = SFTMemmapDatasetShifted(val_data_dir, context_len, PAD_TOKEN, IGNORE_TOKEN, token_dtype)
+        return training_set, validation_set
+    raise ValueError(f"bad training stage {training_stage}")
+
+
+def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint: str):
+    # TODO: only allow a fresh model if pretraining, in any other case require loading the model
+
+    train_data_dir = ""
+    val_data_dir = ""
+    tokenizer_dir = "" # TODO: set these
+    # assert you set these
+    assert train_data_dir and val_data_dir and tokenizer_dir
+
+    config = get_config_for_training_stage(training_stage)
     assert config.batch_effective_size % config.batch_micro_size == 0
 
     run_name, save_dir = resolve_run_name(run_name, resume_name)
@@ -157,20 +233,21 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
         else nullcontext()
     )
 
-    with wandb.init(mode="disabled",config=config,project="casallm-pretraining",entity="alancasallas-self",name=run_name) as run:
+    with wandb.init(mode="disabled",config=config, project=f"casallm-{training_stage}",entity="alancasallas-self",name=run_name) as run:
         C = wandb.config
 
         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_dir)
 
         # IndexedLMDataset is a custom dataset that loads tokens from memory mapped .bin files. It will return x and y, both of length context_len.
-        token_dtype = np.uint16 if tok.vocab_size is not None and tok.vocab_size <= 65535 else np.uint32
-        training_set = IndexedLMDataset(train_token_path, train_index_path, dtype=token_dtype)
-        validation_set = IndexedLMDataset(val_token_path, val_index_path, dtype=token_dtype)
+        token_dtype = np.uint16 if tokenizer.vocab_size is not None and tokenizer.vocab_size <= 65535 else np.uint32
+
+        training_set, validation_set = get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, C.context_len, token_dtype)
 
         # Create data loaders for our datasets; shuffle for training, not for validation
+        # TODO: if gpu-util is not high enough, adjust settings (an example is above).
         train_loader = torch.utils.data.DataLoader(
             train_set, batch_size=C.batch_micro_size, shuffle=True,
-            drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True,
+            drop_last=True, num_workers=8, pin_memory=True, persistent_workers=True,
         )
         val_loader = torch.utils.data.DataLoader(
             val_set, batch_size=C.batch_micro_size, shuffle=False,
@@ -194,6 +271,9 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
             fused=(fused_available and device_type == "cuda"),
         )
 
+        # TODO: you need to change loss and accuracy to include IGNORE_TOKEN, PAD_TOKEN, and be different for DPO.
+        # TODO: I wish you had stronger context_len checks, just be careful for now and put them in soon.
+
         # LR schedule: warmup + cosine on optimizer steps
         grad_accum = C.batch_effective_size // C.batch_micro_size
         steps_per_epoch = math.ceil(len(train_loader) / grad_accum)
@@ -211,7 +291,8 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
         # Resume
         start_epoch, global_step, best_val = 0, 0, float("inf")
 
-        if resume_checkpoint:
+        # TODO: you're about to move DPO into its own file.
+        if resume_checkpoint or training_stage == STAGE_SFT:
             ckpt_path = os.path.join(save_dir, resume_checkpoint)
             start_epoch, global_step, extra = load_checkpoint(
                 ckpt_path, model, optimizer, scheduler, map_location=str(device)
@@ -219,14 +300,17 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
             best_val = extra.get("best_val", best_val)
             print(f"Resumed from {ckpt_path} at epoch={start_epoch}, global_step={global_step}")
 
-        eval_and_save_every_steps = 1000
-        print_every_steps = 100
+        eval_and_save_every_steps = 10
+        print_every_steps = 1
         # Let's assert gradient_accum_steps is an integer, and also that we print and eval/save when a optimizer step is complete.
         assert eval_and_save_every_steps % grad_accum == 0
         assert print_every_steps % grad_accum == 0
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
+
+        last_print_time = time.time()
+        running_micro = 0
 
         for epoch in range(start_epoch, C.num_epochs):
             print(f"\nEPOCH {epoch}")
@@ -241,17 +325,17 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
                 inputs = inputs.to(device, non_blocking=True).long()
                 labels = labels.to(device, non_blocking=True).long()
 
-                # Pretraining: assert no PADs present
-                assert (inputs != PAD_TOKEN).all() and (labels != PAD_TOKEN).all(), \
-                    "Pretraining batches must not contain PAD tokens."
-
                 # Basic shape checks
                 assert inputs.dim() == 2 and labels.dim() == 2
                 assert inputs.size(1) == C.context_len, "context_len mismatch with pretokenized dataset"
 
                 with autocast_ctx:
-                    logits = model(inputs)  # (B,T,V)
-                    loss = model_loss(logits, labels) / grad_accum
+                    if training_stage == STAGE_PRETRAINING or training_stage == STAGE_SFT:
+                        logits = model(inputs)  # (B,T,V)
+                        loss = model_loss(logits, labels) / grad_accum
+                    elif training_stage == STAGE_DPO:
+                        # In DPO
+                        pass
 
                 loss.backward()
                 running_micro += 1
@@ -267,8 +351,15 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
                     running_loss_sum += loss.item() * grad_accum  # undo /grad_accum for readability
                     running_batches += 1
                     if global_step % print_every == 0 and running_batches > 0:
+                        if device.type == "cuda":
+                            torch.cuda.synchronize()
+                        now = time.time()  # or datetime.now() if you prefer
+                        dt = now - last_print_time
+                        last_print_time = now
+                        tok_per_step = C.batch_effective_size * context_len * grad_accum
+                        tok_per_sec = (print_every * tok_per_step) / max(dt, 1e-9)
                         avg_loss = running_loss_sum / running_batches
-                        print(f"step {global_step} | train_loss {avg_loss:.4f} | lr {scheduler.get_last_lr()[0]:.2e}")
+                        print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e")
 
                     # periodic eval + checkpoint
                     if global_step % eval_every == 0:
@@ -324,6 +415,7 @@ def main(run_name: str, resume_name: str, resume_checkpoint: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("training_stage", choices=[STAGE_PRETRAINING,STAGE_SFT,STAGE_DPO])
     parser.add_argument("run_name", type=str, help="wandb run name")
     parser.add_argument("--resume-name", type=str, default=None, help="existing run to resume (dir must exist)")
     parser.add_argument("--resume-checkpoint", type=str, default=None, help="checkpoint file under *_ckpts/")
