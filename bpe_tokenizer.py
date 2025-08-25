@@ -13,7 +13,7 @@ from transformers import PreTrainedTokenizerFast
 SEED = 42
 SPECIAL_TOKENS = ["<s>", "</s>", "<pad>", "<|system|>", "<|user|>", "<|assistant|>"]
 VOCAB_SIZE = 40_960  # includes special tokens
-JOIN_BATCH = 20_000
+JOIN_BATCH = 1_000
 
 def main():
     remote_name = "sample-10BT"
@@ -60,8 +60,7 @@ def main():
     bos_id = tokenizer.token_to_id("<s>")
     eos_id = tokenizer.token_to_id("</s>")
     tokenizer.post_processor = TemplateProcessing(
-        single="<s>$A</s>",
-        pair="<s>$A</s> <s>$B</s>",
+        single="<s> $A </s>",
         special_tokens=[("<s>", bos_id), ("</s>", eos_id)],
     )
 

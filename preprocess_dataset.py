@@ -14,8 +14,7 @@ from tqdm import tqdm
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--split", default="train")
-    ap.add_argument("--tokenizer_dir", required=True, help="Path to saved tokenizer (directory with tokenizer.json)")
+    ap.add_argument("--split", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--context_len", type=int, default=1024)
     ap.add_argument("--stride", type=int, default=None, help="Defaults to context_len (non-overlap)")
@@ -28,17 +27,40 @@ def main():
     meta_path = out / "meta.json"
 
     # Load tokenizer
-    tok: PreTrainedTokenizerFast = PreTrainedTokenizerFast.from_pretrained(args.tokenizer_dir)
+    tok: PreTrainedTokenizerFast = PreTrainedTokenizerFast.from_pretrained("casallm_bpe")
     bos_id = tok.bos_token_id
     eos_id = tok.eos_token_id
     pad_id = tok.pad_token_id
     if bos_id is None or eos_id is None:
         raise ValueError("Tokenizer must have bos_token and eos_token set.")
+    print(f"Tokenizer loaded, vocab size is {tok.vocab_size}")
 
     # Choose dtype
     token_dtype = np.uint16 if tok.vocab_size is not None and tok.vocab_size <= 65535 else np.uint32
 
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split=args.split)
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT")
+
+    # Use a fixed seed for reproducibility
+    SEED = 42
+
+    # Hold out 1% for validation
+    split_ds = ds["train"].train_test_split(
+        test_size=0.015,   # 1.5% validation
+        seed=SEED,
+        shuffle=True
+    )
+
+    train_ds = split_ds["train"]
+    val_ds = split_ds["test"]
+
+    print(f"split into train and validation (using deterministic seed): train length {len(train_ds)} val length {len(val_ds)}")
+
+    if args.split == "train":
+        ds = train_ds
+    elif args.split == "validation":
+        ds = val_ds
+    else:
+        raise ValueError(f"unrecognized split {args.split}")
 
     # First we tokenize text and write it to a file in a streaming manner.
     total_tokens = 0
@@ -96,8 +118,6 @@ def main():
         "stride": stride,
         "num_samples": int(n_samples),
         "dataset": {
-            "name": args.dataset_name,
-            "config": args.dataset_config,
             "split": args.split
         }
     }
