@@ -21,10 +21,26 @@ from common_utils import save_checkpoint, load_checkpoint
 from transformer import Transformer
 from lmdataset import IndexedLMDataset
 
-# right away: loading the right things in this script
-# accuracy: put padding tokens in
+# TODO: right now.
 # split train and val for dpo.
-# hey, can you make SFT usable (without the filtering of samples yet.)
+# I think you're at the point where you start sizing for a pretrain run.
+
+
+
+
+# consider collecting all TODO's in one main todo file. (to make a final schedule over three days).
+# TODO: somehting you should know soon is whether to use 10B or 100B tokens.
+# TODO: I wonder if saving the RNG will help you pick up where you left off for tokens.
+
+# step 1: first step is to size your transformer in VRAM
+# step 2.1: make sure the checkpointing stuff works!
+# step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
+# step 6: hey before you kick off large scale training, overfit one batch.
+# step 8: get torch compile in here.
+
+# each training loop takes only a few minutes to run, so by end of day you should be able to run a generate() function on a model that has undergone all three stages.
+# note: if torch.compile clamps down batch size, is that ok for SFT and DPO because we're still using the same by-sample batch size?
+
 
 
 """
@@ -53,14 +69,7 @@ All models were trained for a total of 300 billion tokens --> but remember you h
 
 """
 
-# step 1: first step is to size your transformer in VRAM
-# step 2.1: make sure the checkpointing stuff works!
-# step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
-# step 1.5 - finish the sft stuff to completion.
-# step 5: your inference.py may just want to print out one inference at a time first.
-# step 6: hey before you kick off large scale training, overfit one batch.
-# step 8: get torch compile in here.
-# step 9: a random seed will help you if you have to restart training.
+
 
 # later recommendation: Consider gradient checkpointing inside blocks if you push context length or model size.
 
@@ -107,7 +116,6 @@ PAD_TOKEN = 0
 IGNORE_TOKEN = -100 # token that loss functions will ignore
 STAGE_PRETRAINING = "pretraining"
 STAGE_SFT = "sft"
-STAGE_DPO = "dpo"
 
 # use NVIDIA's tf32.
 torch.set_float32_matmul_precision('high')
@@ -145,10 +153,12 @@ def model_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     )
 
 @torch.no_grad()
-def model_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
-    """Mean token accuracy over all tokens (no PADs expected)."""
-    pred = logits.argmax(dim=-1)  # (B,T)
-    return (pred == labels).float().mean().item()
+def accuracy_counts(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int = -100):
+    pred = logits.argmax(dim=-1)
+    valid = labels.ne(ignore_index)
+    correct = (pred.eq(labels) & valid).sum()
+    total = valid.sum()
+    return correct.item(), total.item()
 
 def resolve_run_name(run_name, resume_name):
     """
@@ -217,8 +227,9 @@ def get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, context
     raise ValueError(f"bad training stage {training_stage}")
 
 
-def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint: str):
-    # TODO: only allow a fresh model if pretraining, in any other case require loading the model
+def main(training_stage: str, pretrained_name, pretrained_checkpoint, run_name: str, resume_name: str, resume_checkpoint: str):
+    if training_stage ==  STAGE_SFT:
+        assert pretrained_name # if we are in SFT, there must be a corresponding pretrained model to start from.
 
     train_data_dir = ""
     val_data_dir = ""
@@ -244,7 +255,6 @@ def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint
 
         # IndexedLMDataset is a custom dataset that loads tokens from memory mapped .bin files. It will return x and y, both of length context_len.
         token_dtype = np.uint16 if tokenizer.vocab_size is not None and tokenizer.vocab_size <= 65535 else np.uint32
-
         training_set, validation_set = get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, C.context_len, token_dtype)
 
         # Create data loaders for our datasets; shuffle for training, not for validation
@@ -275,9 +285,6 @@ def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint
             fused=(fused_available and device_type == "cuda"),
         )
 
-        # TODO: you need to change loss and accuracy to include IGNORE_TOKEN, PAD_TOKEN, and be different for DPO.
-        # TODO: I wish you had stronger context_len checks, just be careful for now and put them in soon.
-
         # LR schedule: warmup + cosine on optimizer steps
         grad_accum = C.batch_effective_size // C.batch_micro_size
         steps_per_epoch = math.ceil(len(train_loader) / grad_accum)
@@ -294,18 +301,22 @@ def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint
 
         # Resume
         start_epoch, global_step, best_val = 0, 0, float("inf")
-
-        # TODO: you're about to move DPO into its own file.
-        if resume_checkpoint or training_stage == STAGE_SFT:
+        if resume_name:
             ckpt_path = os.path.join(save_dir, resume_checkpoint)
             start_epoch, global_step, extra = load_checkpoint(
                 ckpt_path, model, optimizer, scheduler, map_location=str(device)
             )
             best_val = extra.get("best_val", best_val)
             print(f"Resumed from {ckpt_path} at epoch={start_epoch}, global_step={global_step}")
+        elif training_stage == STAGE_SFT:
+            # load from a pretrained model
+            pretrained_save_dir=f"./{pretrained_name}_ckpts"
+            pretrained_ckpt_path = os.path.join(pretrained_save_dir, pretrained_checkpointain)
+            pretrained_ckpt = torch.load(pretrained_ckpt_path, map_location=str(device))
+            model.load_state_dict(pretrained_ckpt["model"])
 
-        eval_and_save_every_steps = 10
-        print_every_steps = 1
+        eval_and_save_every_steps = 100
+        print_every_steps = 10
         # Let's assert gradient_accum_steps is an integer, and also that we print and eval/save when a optimizer step is complete.
         assert eval_and_save_every_steps % grad_accum == 0
         assert print_every_steps % grad_accum == 0
@@ -334,12 +345,8 @@ def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint
                 assert inputs.size(1) == C.context_len, "context_len mismatch with pretokenized dataset"
 
                 with autocast_ctx:
-                    if training_stage == STAGE_PRETRAINING or training_stage == STAGE_SFT:
-                        logits = model(inputs)  # (B,T,V)
-                        loss = model_loss(logits, labels) / grad_accum
-                    elif training_stage == STAGE_DPO:
-                        # In DPO
-                        pass
+                    logits = model(inputs)  # (B,T,V)
+                    loss = model_loss(logits, labels) / grad_accum
 
                 loss.backward()
                 running_micro += 1
@@ -378,7 +385,8 @@ def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint
                         model.eval()
                         val_loss_sum = 0.0
                         val_batches = 0
-                        val_acc_sum = 0.0
+                        val_acc_correct = 0.0
+                        val_acc_total = 0
 
                         with torch.no_grad():
                             for inputs_v, labels_v in val_loader:
@@ -389,21 +397,13 @@ def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint
                                 logits_v = model(inputs_v)
                                 batch_loss = model_loss(logits_v, labels_v)
                                 val_loss_sum += batch_loss.item()
-                                val_acc_sum += model_accuracy(logits_v, labels_v)
-                                val_batches += 1
+                                acc_correct, acc_total = accuracy_counts(logits_v, labels_v)
+                                val_acc_correct += acc_correct
+                                val_acc_total += acc_total
 
                         val_loss = val_loss_sum / max(1, val_batches)
-                        val_acc = val_acc_sum / max(1, val_batches)
+                        val_acc = val_acc_correct / max(1, val_acc_total)
                         print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
-
-                        if val_loss < best_val:
-                            best_val = val_loss
-                            best_path = os.path.join(save_dir, "best.pth")
-                            save_checkpoint(
-                                best_path, model, optimizer, scheduler, epoch, global_step,
-                                extra={"best_val": best_val}
-                            )
-                            print(f"New best (val_loss={best_val:.4f}). Saved {best_path}.")
 
                         wandb.log({
                             "epoch": epoch,
@@ -419,12 +419,14 @@ def main(training_stage: str, run_name: str, resume_name: str, resume_checkpoint
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("training_stage", choices=[STAGE_PRETRAINING,STAGE_SFT,STAGE_DPO])
+    parser.add_argument("training_stage", choices=[STAGE_PRETRAINING, STAGE_SFT])
     parser.add_argument("run_name", type=str, help="wandb run name")
+    parser.add_argument("--pretrained-name", type=str, default=None, help="existing run to resume (dir must exist)")
+    parser.add_argument("--pretrained-checkpoint", type=str, default=None, help="checkpoint file under *_ckpts/")
     parser.add_argument("--resume-name", type=str, default=None, help="existing run to resume (dir must exist)")
     parser.add_argument("--resume-checkpoint", type=str, default=None, help="checkpoint file under *_ckpts/")
     args = parser.parse_args()
 
     main(
-        args.run_name, args.resume_name, args.resume_checkpoint
+        args.run_name, args.pretrained_name, args.pretrained_checkpoint, args.resume_name, args.resume_checkpoint
     )

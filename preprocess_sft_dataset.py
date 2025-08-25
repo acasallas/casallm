@@ -1,10 +1,17 @@
+#!/usr/bin/env python3
+
+import os, json, argparse
+import random
+from pathlib import Path
+from typing import List, Dict, Tuple
+
 from datasets import load_dataset
+import numpy as np
+from transformers import PreTrainedTokenizerFast
+from tqdm import tqdm
 
 
 # Reminder: we're gonna use both sft and gen splits in the ultrachat dataset for sft.
-
-
-# TODO: detokenize all datasets when you load them to make sure they look good and have the right format going in.
 
 # TODO: let's analyze the ultrachat_200k dataset
 # does it have "who are you" type questions. If not inject them and say you are CasaLLM.
@@ -94,56 +101,32 @@ def inject_system(example):
     example["messages"] = new_msgs
     return example
 
-# before you leetcode, leave these TODO items in good shape.
+def clean_dataset():
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k")
 
+    count = 0
 
+    found = 0
 
-ds = load_dataset("HuggingFaceH4/ultrachat_200k")
+    keywords = ["gpt", "GPT", "Gpt"]
 
-count = 0
+    #keywords = ["The answer is not applicable as AI language model GPT-3 is not capable of browsing the internet",
+    #"The following is a transcription of the solo piano composition created by the AI language model"]#["gpt","GPT","Gpt"]#,"Gemini","gemini","Claude","claude"]
 
-found = 0
+    for i, sample in enumerate(ds["test_gen"]):
+    	count += 1
+    	for convo in sample["messages"]:
+    		msg = convo["content"]
+    		if any([k in msg for k in keywords]):
+    			#print(sample["messages"])
+    			#print(f"INDEX: {i}")
+    			print(msg)
+    			print("---")
+    			found += 1
+    	if count > 500000:
+    		break
 
-keywords = ["gpt", "GPT", "Gpt"]
-
-#keywords = ["The answer is not applicable as AI language model GPT-3 is not capable of browsing the internet",
-#"The following is a transcription of the solo piano composition created by the AI language model"]#["gpt","GPT","Gpt"]#,"Gemini","gemini","Claude","claude"]
-
-for i, sample in enumerate(ds["test_gen"]):
-	count += 1
-	for convo in sample["messages"]:
-		msg = convo["content"]
-		if any([k in msg for k in keywords]):
-			#print(sample["messages"])
-			#print(f"INDEX: {i}")
-			print(msg)
-			print("---")
-			found += 1
-	if count > 500000:
-		break
-
-print(f"total found: {found}")
-
-
-
-
-def tokenize_sft_dataset():
-	ds = load_dataset("HuggingFaceH4/ultrachat_200k")
-	# let's tokenize it.
-	# TODO: I do think before you do this you should put system prompts in.
-	# TODO: if you have problems later on you can always try taking system prompts away.
-
-
-
-
-#!/usr/bin/env python3
-import os, json, argparse
-from pathlib import Path
-from typing import List, Dict, Tuple
-
-import numpy as np
-from transformers import PreTrainedTokenizerFast
-from tqdm import tqdm
+    print(f"total found: {found}")
 
 
 SPECIAL_TOKENS = {
@@ -239,14 +222,20 @@ def left_truncate(ids: List[int], mask: List[int], max_len: int) -> Tuple[List[i
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in_jsonl", required=True,
-                    help="Path to JSONL where each line is a list of {role,content} messages.")
     ap.add_argument("--tokenizer_dir", required=True,
                     help="Path to HF tokenizer directory (with tokenizer.json).")
+    ap.add_argument("--split", required=True, choices = ["train", "validation"])
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--context_len", type=int, default=2048,
                     help="Pre-truncate each sample to this many tokens (left-truncate).")
     args = ap.parse_args()
+
+    if ap.split == "train":
+        split = "train_sft"
+    elif ap.split == "validation":
+        split = "test_sft"
+
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=split)
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -274,36 +263,36 @@ def main():
         idx_f.write(np.uint64(offset).tobytes())
         idx_f.write(np.uint64(length).tobytes())
 
-    # Stream the input JSONL
-    with open(args.in_jsonl, "r", encoding="utf-8") as f:
-        pbar = tqdm(f, desc="Tokenizing SFT samples", unit="sample")
-        for line in pbar:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                messages = json.loads(line)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Bad JSON line: {e}\nLine: {line[:200]}")
+    lengths = []
 
-            ids, lmask = encode_chat_to_ids_and_mask(messages, tok)
-            ids, lmask = left_truncate(ids, lmask, args.context_len)
+    pbar = tqdm(ds, desc="Tokenizing SFT samples", unit="sample")
+    for ex in pbar:
+        messages = ex["messages"]
+        messages.insert(0, {"content": random.sample(system_prompts), "role": "system"})
 
-            # Write tokens
-            arr = np.asarray(ids, dtype=token_dtype)
-            arr.tofile(tok_f)
+        ids, lmask = encode_chat_to_ids_and_mask(messages, tok)
 
-            # Write loss mask (uint8)
-            m = np.asarray(lmask, dtype=np.uint8)
-            m.tofile(mask_f)
+        lengths.append(len(ids))
 
-            # Write index for this sample
-            write_index(total_tokens, len(ids))
+        ids, lmask = left_truncate(ids, lmask, args.context_len)
 
-            total_tokens += len(ids)
-            sample_count += 1
+        # Write tokens
+        arr = np.asarray(ids, dtype=token_dtype)
+        arr.tofile(tok_f)
+
+        # Write loss mask (uint8)
+        m = np.asarray(lmask, dtype=np.uint8)
+        m.tofile(mask_f)
+
+        # Write index for this sample
+        write_index(total_tokens, len(ids))
+
+        total_tokens += len(ids)
+        sample_count += 1
 
     tok_f.close(); mask_f.close(); idx_f.close()
+
+    print(f"Final report on sample lengths: mean {np.mean(lengths)} std {np.std(lengths)} min {np.min(lengths)} max {np.max(lengths)}")
 
     meta = {
         "dtype": str(token_dtype).split("'")[1],  # "uint16" or "uint32"
@@ -333,11 +322,6 @@ def main():
             "newline_between": True,
             "masking": "1 on assistant content tokens only; 0 elsewhere (roles/system/user/BOS/EOS).",
         },
-        "source": {
-            "format": "jsonl",
-            "schema": '[{"role": "...", "content": "..."}]',
-            "path": str(Path(args.in_jsonl).resolve())
-        },
         "tokenizer_dir": str(Path(args.tokenizer_dir).resolve())
     }
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -353,16 +337,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
 

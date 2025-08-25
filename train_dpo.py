@@ -234,8 +234,8 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
         ref_model.load_state_dict(sft_ckpt["model"])
         # TODO: ref_model should be in eval()?
 
-        eval_and_save_every_steps = 10
-        print_every_steps = 1
+        eval_and_save_every_steps = 100
+        print_every_steps = 10
         # Let's assert gradient_accum_steps is an integer, and also that we print and eval/save when a optimizer step is complete.
         assert eval_and_save_every_steps % grad_accum == 0
         assert print_every_steps % grad_accum == 0
@@ -252,8 +252,6 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
             running_batches = 0
 
             for micro_step, batch in enumerate(train_loader):
-                # TODO: rename batch and finish fixing this training loop.
-
                 # Start a new accumulation window when the *global* micro step hits a boundary
                 if running_micro % grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
@@ -383,13 +381,6 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                         val_acc = running_val_acc_sum / max(1, running_val_sample_count)
                         val_acc_ref = running_val_acc_ref_sum / max(1, running_val_sample_count)
                         print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
-
-                        best_path = os.path.join(save_dir, "best.pth")
-                        save_checkpoint(
-                            best_path, model, optimizer, scheduler, epoch, global_step,
-                            extra={"val_loss": val_loss}
-                        )
-                        print(f"New checkpoint saved {best_path}.")
 
                         wandb.log({
                             "epoch": epoch,

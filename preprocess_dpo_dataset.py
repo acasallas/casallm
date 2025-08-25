@@ -1,15 +1,3 @@
-# we're gonna have a preprocess script
-# REMEMBER to split the dpo dataset into train and validation
-# then have a dataset that emits the batch as needed
-# then include that in the training loop
-# then you finish all training loops.
-# then why don't you tokenize all datasets and make sure they can be loaded into all training loops?
-
-# 3pm leetcode lol.
-
-# each loop takes only a few minutes to run, so by end of day you should be able to run a generate() function on a model that has undergone all three stages.
-# note: if torch.compile clamps down batch size, is that ok for SFT and DPO because we're still using the same by-sample batch size?
-
 #!/usr/bin/env python3
 # dpo_prepare.py
 # Tokenize Argilla DPO pairs into HF Arrow with {prompt_ids, chosen_ids, rejected_ids}
@@ -156,7 +144,6 @@ def main():
     ap.add_argument("--tokenizer_dir", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--num_proc", type=int, default=1)
-    ap.add_argument("--max_samples", type=int, default=None, help="For quick dry runs.")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -170,10 +157,27 @@ def main():
     # 2) Load source dataset
     print(f"Loading dataset: {args.dataset_name} [{args.split}]")
     ds = load_dataset(args.dataset_name, split=args.split)
-    # TODO: remember you gotta split into train and val
 
-    if args.max_samples:
-        ds = ds.select(range(min(args.max_samples, len(ds))))
+    SEED = 42
+
+    # Hold out 1% for validation
+    split_ds = ds["train"].train_test_split(
+        test_size=0.05,   # 5% validation
+        seed=SEED,
+        shuffle=True
+    )
+
+    train_ds = split_ds["train"]
+    val_ds = split_ds["test"]
+
+    print(f"split into train and validation (using deterministic seed): train length {len(train_ds)} val length {len(val_ds)}")
+
+    if args.split == "train":
+        ds = train_ds
+    elif args.split == "validation":
+        ds = val_ds
+    else:
+        raise ValueError(f"unrecognized split {args.split}")
 
     # 3) Filter invalid rows (missing responses, etc.)
     ds = ds.filter(_is_valid, num_proc=args.num_proc or None, desc="Filtering empty/invalid pairs")
