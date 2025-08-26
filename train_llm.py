@@ -272,7 +272,8 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         # the forward() function of the transformer takes input_ids: (B, T) and returns logits # (B, T, vocab_size)
         print(f"vocab size is gonna be: {tokenizer.vocab_size}")
         print(f"but tokenizer len is {len(tokenizer)}")
-        model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, C.num_heads, C.dropout_rate, C.num_blocks, PAD_TOKEN)
+        model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, C.num_heads, C.dropout_rate, C.num_blocks, 
+            PAD_TOKEN, training_stage == STAGE_PRETRAINING)
 
         # This code was added because torchinfo.summary was double-counting tied weights.
         # 1) Prove it’s the same tensor
