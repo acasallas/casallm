@@ -198,6 +198,11 @@ def main():
     }
     ds_tok = ds_tok.cast(Features(feat_dict))
 
+    # print out stats
+    print(f"prompt len mean: {np.mean(ds_tok['prompt_len'])} std: {np.std(ds_tok['prompt_len'])} min {np.min(ds_tok['prompt_len'])} max {np.max(ds_tok['prompt_len'])}")
+    print(f"chosen len mean: {np.mean(ds_tok['chosen_len'])} std: {np.std(ds_tok['chosen_len'])} min {np.min(ds_tok['chosen_len'])} max {np.max(ds_tok['chosen_len'])}")
+    print(f"rejected len mean: {np.mean(ds_tok['rejected_len'])} std: {np.std(ds_tok['rejected_len'])} min {np.min(ds_tok['rejected_len'])} max {np.max(ds_tok['rejected_len'])}")
+
     # 6) Save Arrow dataset to disk
     ds_tok.save_to_disk(str(out_dir))
     print(f"Saved Arrow dataset to: {out_dir}")

@@ -25,6 +25,7 @@ class IndexedLMDataset(torch.utils.data.Dataset):
         self.index_path = index_path
         self.dtype = dtype
         self.seq = context_len+1
+        self.perm = None # permutation array, to be set in a later function
 
         # Lazily open memmaps in worker process to avoid big pickles
         self._tokens = None
@@ -42,17 +43,22 @@ class IndexedLMDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         self._ensure_open()
-        return self._starts.shape[0]
+        return len(self.perm) if self.perm is not None else self._starts.shape[0]
 
     def __getitem__(self, idx):
         self._ensure_open()
-        s = int(self._starts[idx])
+        # remap through permutation if provided
+        real_idx = int(self.perm[idx]) if self.perm is not None else idx
+        s = int(self._starts[real_idx])
         e = s + self.seq
         seq = self._tokens[s:e]          # view on memmap, no copy
         # Convert to tensors; (important) clone to get page-locked batch if pin_memory
         x = torch.as_tensor(seq[:-1].astype(np.int64))  # inputs
         y = torch.as_tensor(seq[1:].astype(np.int64))   # labels
         return x, y
+
+    def set_permutation_array(self, perm):
+        self.perm = perm
 
 
 
