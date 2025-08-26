@@ -191,7 +191,7 @@ class Transformer(nn.Module):
         if T > self.context_len:
             raise ValueError(f"seq len {T} exceeds context_len {self.context_len}")
 
-        x = self.embedding(input_ids) * math.sqrt(self.embed_dim)  # (B, T, E)
+        x = self.embedding(input_ids) # scaling commented out because we are using RoPE: * math.sqrt(self.embed_dim)  # (B, T, E)
 
         # Match q/k dtype automatically by using x.dtype (autocast-friendly)
         cos = self.rope_cos_table[:T].to(dtype=x.dtype)
