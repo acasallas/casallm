@@ -4,7 +4,6 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-import wandb
 
 
 # note for inference there's two steps: a prefill (that generates a kv cache) and a decode step (where you use the kv cachce)

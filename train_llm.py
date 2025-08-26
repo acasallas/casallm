@@ -189,9 +189,12 @@ def get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, context
 def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resume_name, resume_checkpoint):
     if training_stage ==  STAGE_SFT:
         assert pretrained_name and pretrained_checkpoint # if we are in SFT, there must be a corresponding pretrained model to start from.
+        train_data_dir = "tokenized_sft_train_2048"
+        val_data_dir = "tokenized_sft_validation_2048"
+    else:
+        train_data_dir = "tokenized_pretrain_train_2048"
+        val_data_dir = "tokenized_pretrain_validation_2048"
 
-    train_data_dir = "tokenized_pretrain_train_2048"
-    val_data_dir = "tokenized_pretrain_validation_2048"
     tokenizer_dir = "casallm_bpe"
 
     config = get_config_for_training_stage(training_stage)
