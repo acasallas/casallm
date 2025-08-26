@@ -20,7 +20,7 @@ TOP_P = None
 TOP_K = None
 TEMPERATURE = 0.6
 
-
+# for now, you will just take ONE SAMPLE, and stream tokens back (figure out how that works with Gradio.)
 def run_inference(model, system_string, conversation_strings):
 	tok = PreTrainedTokenizerFast.from_pretrained("./casallm_bpe")
 	print(f"loaded tokenizer with a {tok.vocab_size} vocab size.")

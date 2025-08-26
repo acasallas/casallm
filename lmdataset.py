@@ -193,103 +193,62 @@ class DPODataset(Dataset):
 def dpo_collate(
     examples: List[Dict[str, List[int]]],
     pad_id: int,
+    ignore_id: int,
     max_len: int,
     min_prompt_tokens: int = 1,
+    eos_id: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Build a 2B-by-T batch in [chosen, rejected] order per pair.
-    - input_ids: padded with pad_id to length T=max_len (or the max in batch if smaller)
-    - labels:    -100 on prompt and padding; tokens over assistant content are trained
-    - pair_ids:  (2B,) tells which pair each row belongs to
-    - is_chosen: (2B,) 1 for chosen, 0 for rejected
+    Build a (2B, T) batch in [chosen, rejected] order per pair.
+    Returns:
+      input_ids: (2B, T)
+      labels:    (2B, T) with ignore_id on prompt & PAD, response tokens copied (for masking)
+      pair_ids:  (2B,)
+      is_chosen: (2B,) 1 for chosen, 0 for rejected
     """
-    # 1) Decide a fixed T for the batch
     T = max_len
 
-    def clamp_shared_prompt(p: List[int], c_len: int, r_len: int) -> List[int]:
-        """
-        Enforce the SAME prompt prefix for both branches by reserving space
-        for the SHORTER response. This keeps comparisons fair.
-        """
+    def clamp_shared_prompt(p, c_len, r_len):
+        # Reserve space for the SHORTER response to keep branches directly comparable
         budget_for_prompt = max(min_prompt_tokens, T - min(c_len, r_len))
         if len(p) > budget_for_prompt:
-            return p[-budget_for_prompt:]  # keep most recent tokens
+            return p[-budget_for_prompt:]
         return p
 
-    seqs: List[List[int]] = []
-    resp_starts: List[int] = []
-    pair_ids: List[int] = []
-    is_chosen: List[int] = []
+    seqs, resp_starts, pair_ids, is_chosen = [], [], [], []
 
     for k, ex in enumerate(examples):
-        p = ex["prompt_ids"]
-        c = ex["chosen_ids"]
-        r = ex["rejected_ids"]
-
+        p = ex["prompt_ids"]; c = ex["chosen_ids"]; r = ex["rejected_ids"]
         p_shared = clamp_shared_prompt(p, len(c), len(r))
 
-        pc = p_shared + c
-        pr = p_shared + r
+        def build_seq(resp):
+            s = p_shared + resp
+            if eos_id is not None and len(s) < T:
+                s = s + [eos_id]
+            return s
 
-        # maintain strict [chosen, rejected] ordering
-        seqs.append(pc)
-        resp_starts.append(len(p_shared))
-        pair_ids.append(k)
-        is_chosen.append(1)
+        pc = build_seq(c)
+        pr = build_seq(r)
 
-        seqs.append(pr)
-        resp_starts.append(len(p_shared))
-        pair_ids.append(k)
-        is_chosen.append(0)
+        seqs.append(pc); resp_starts.append(len(p_shared)); pair_ids.append(k); is_chosen.append(1)
+        seqs.append(pr); resp_starts.append(len(p_shared)); pair_ids.append(k); is_chosen.append(0)
 
     B2 = len(seqs)
-
-    # 2) Allocate tensors
     input_ids = torch.full((B2, T), pad_id, dtype=torch.long)
-    labels = torch.full((B2, T), -100, dtype=torch.long)  # ignore everywhere by default
+    labels    = torch.full((B2, T), ignore_id,   dtype=torch.long)
 
-    # 3) Pad/truncate + build labels (score only response tokens)
     for i, (s, rs) in enumerate(zip(seqs, resp_starts)):
-        # truncate right
         s = s[:T]
         L = len(s)
         if L > 0:
             input_ids[i, :L] = torch.tensor(s, dtype=torch.long)
-            # enable loss only over the response section (and only where not truncated)
-            if L > rs:
-                labels[i, rs:L] = input_ids[i, rs:L]
+            if L > rs + 1:
+                # mark response tokens as targets (next-token prediction)
+                labels[i, rs:L-1] = input_ids[i, rs+1:L]
 
-    batch = {
-        "input_ids": input_ids,               # (2B, T)
-        "labels": labels,                     # (2B, T)
-        "pair_ids": torch.tensor(pair_ids),   # (2B,)
-        "is_chosen": torch.tensor(is_chosen), # (2B,)
+    return {
+        "input_ids": input_ids,                 # (2B, T)
+        "labels": labels,                       # (2B, T) response-only, -100 elsewhere
+        "pair_ids": torch.tensor(pair_ids),     # (2B,)
+        "is_chosen": torch.tensor(is_chosen),   # (2B,)
     }
-    return batch
-
-# ---------------------------
-# Minimal usage (example)
-# ---------------------------
-if __name__ == "__main__":
-    from torch.utils.data import DataLoader
-
-    data_dir = "./orca_dpo_tokenized"  # path you saved with save_to_disk(...)
-    pad_id = 0                         # <-- Prefer tok.pad_token_id here
-    max_len = 2048
-    batch_size_pairs = 8               # B = pairs per step
-
-    ds = DPODataset(data_dir)
-
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size_pairs,
-        shuffle=True,  # shuffles PAIRS; collate preserves [chosen, rejected] within each pair
-        num_workers=4,
-        pin_memory=True,
-        collate_fn=lambda ex: dpo_collate(ex, pad_id=pad_id, max_len=max_len),
-        drop_last=True,  # keeps shapes stable for DDP/mixed precision, optional
-    )
-
-    # quick smoke test
-    batch = next(iter(loader))
-    print({k: (v.shape if hasattr(v, "shape") else type(v)) for k, v in batch.items()})

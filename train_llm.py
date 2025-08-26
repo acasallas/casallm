@@ -25,17 +25,26 @@ from transformers import PreTrainedTokenizerFast
 
 
 # first thing we gotta do is to do the deterministic shuffling for restarting checkpoints.
-# fix indexing so you can restart from checkpoints
-# absolute victory tonight would look like getting SFT and DPO completley running.
+#save less often, you dont wanna fill up your hard drive.
+#hey, can you plot loss to wandb more often
+
+# train SFT and DPO on checkpoints, and test out their own checkpoint systems.
 # if you wanna leave it running overnight that would probably be fine. I'd like to do kv caching soon though.
 # step 2.1: make sure the checkpointing stuff works!
 # step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
 # TODO: before actual training run, make save checkpoints futher apart.
 # TODO: before actual training run, make wandb run names use real run names.
+# TODO: there's left truncate in two places for the SFT pipeline, I think you should remove one.
+# TODO: for sft you might have a different number of epochs? so pay attention to what you were told regarding leftover samples.
+# finish batched kv caching and inference, then start official training run!
+
+# next steps: todos for inference are largely in transformer.py actually
+# SFT/DPO filtering, todo's are in there.
 
 
 # todo later
 #------------
+# hyperparameters for SFT and DPO are here: https://chatgpt.com/c/68ad3875-80c8-832a-a62f-7e7948d85b71
 # make sure the lambdaLR scheduler is fine.
 # TODO: make sure what you wrote about the ignore token is true.
 # TODO: double check the reindex script was legit.
@@ -124,8 +133,9 @@ def resolve_run_name(run_name, resume_name):
         if os.path.isdir(save_dir):
             raise ValueError(f"Run name {run_name} cannot be created. Already exists on disk.")
         else:
+            os.makedirs(save_dir, exist_ok=True)
+            print(f"Creating directory for {run_name}.")
             return run_name, save_dir
-    raise ValueError("couldn't resolve run name")
 
 def get_config_for_training_stage(training_stage):
     if training_stage == STAGE_PRETRAINING:
@@ -145,18 +155,18 @@ def get_config_for_training_stage(training_stage):
     }
     elif training_stage == STAGE_SFT:
         return {
-        "weight_decay": 0.1,
-        "learning_rate": 3e-4,
-        "min_lr": 3e-5, 
+        "weight_decay": 0.05,
+        "learning_rate": 1e-4,
+        "min_lr": 1e-5, 
         "batch_micro_size": 4, # that's all that fit in VRAM
-        "batch_effective_size": 256, #2**19 tokens
+        "batch_effective_size": 128,
         "num_epochs": 1,
         "num_blocks": 24,
         "dropout_rate": 0.1,
         "embed_dim": 1024,
         "context_len": 2048,
         "num_heads": 16,
-        "warmup_steps": 650
+        "warmup_steps": 50 # TODO: this is for 200,000 samples, if you augment the dataset adjust it.
     }
     raise ValueError(f"bad training stage {training_stage}")
 
@@ -213,7 +223,6 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         train_set, val_set = get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, C.context_len, token_dtype, PAD_TOKEN, IGNORE_TOKEN)
 
         # Create data loaders for our datasets; shuffle for training, not for validation
-        # TODO: if gpu-util is not high enough, adjust settings (an example is above).
         train_loader = torch.utils.data.DataLoader(
             train_set, batch_size=C.batch_micro_size, shuffle=True,
             drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True,
@@ -291,7 +300,8 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
             pretrained_ckpt = torch.load(pretrained_ckpt_path, map_location=device)
             model.load_state_dict(pretrained_ckpt["model"])
 
-        eval_and_save_every_steps = 30 # TODO: this will be higher soon
+        eval_every_steps = 30 # TODO: this will be higher soon (we want it like every 15 min.)
+        save_every_steps = 30 # TODO: this is gonna be very high, like every hour
         print_every_steps = 1
         num_val_micro_batches = 2*C.batch_effective_size//C.batch_micro_size # we'll run two size batches for validation
 
@@ -350,7 +360,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         return # early exit for now.
 
                     # periodic eval + checkpoint
-                    if global_step % eval_and_save_every_steps == 0:
+                    if global_step % save_every_steps == 0:
                         ckpt_path = os.path.join(save_dir, f"step_{global_step}.pth")
                         save_checkpoint(
                             ckpt_path, model, optimizer, scheduler, epoch, global_step,
@@ -358,7 +368,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         )
                         print(f"Saved checkpoint: {ckpt_path}")
 
-                        # Eval
+                    if global_step % eval_every_steps == 0:
                         model.eval()
                         val_loss_sum = 0.0
                         val_batches = 0
@@ -383,6 +393,15 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         val_loss = val_loss_sum / max(1, val_batches)
                         val_acc = val_acc_correct / max(1, val_acc_total)
                         print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
+
+                        if val_loss < best_val:
+                            best_val = val_loss
+                            ckpt_path = os.path.join(save_dir, f"step_{global_step}.pth")
+                            save_checkpoint(
+                                ckpt_path, model, optimizer, scheduler, epoch, global_step,
+                                extra={"best_val": best_val}
+                            )
+                            print(f"Saved checkpoint: {ckpt_path}")
 
                         wandb.log({
                             "epoch": epoch,
