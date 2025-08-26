@@ -19,61 +19,36 @@ import wandb
 
 from common_utils import save_checkpoint, load_checkpoint
 from transformer import Transformer
-from lmdataset import IndexedLMDataset
+from lmdataset import IndexedLMDataset, SFTMemmapDatasetShifted
 from transformers import PreTrainedTokenizerFast
 
-# TODO: fix those little bugs
-# TODO: start reindexing.
-# TODO: you fit, you measure token/sec throughput, and then you think (with torch compile perhaps, how long you will haveto train for.)
-
-# TODO: right off the bat, something's wrong, initial loss should be 10-ish
 
 
-
-
-# consider collecting all TODO's in one main todo file. (to make a final schedule over three days).
-# TODO: somehting you should know soon is whether to use 10B or 100B tokens.
-# TODO: I wonder if saving the RNG will help you pick up where you left off for tokens.
-
-# step 1: first step is to size your transformer in VRAM
+# fix validation so it doesn't take too long
+# fix indexing so you can restart from checkpoints
+# but before you do that, you'll have to activate torch.compile
 # step 2.1: make sure the checkpointing stuff works!
 # step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
-# step 6: hey before you kick off large scale training, overfit one batch.
-# step 8: get torch compile in here.
 
-# TODO: figure out how not to load too much in validation.
 
-# each training loop takes only a few minutes to run, so by end of day you should be able to run a generate() function on a model that has undergone all three stages.
-# note: if torch.compile clamps down batch size, is that ok for SFT and DPO because we're still using the same by-sample batch size?
 
-# TODO: double check that reindex script was legit
+# todo later
+#------------
+# make sure the lambdaLR scheduler is fine.
+# TODO: make sure what you wrote about the ignore token is true.
+
+
+
+
+
+# TODO: double check the reindex script was legit.
+
+
 #TODO: check for duplication between sft_test and gen_test.
 
-"""
-Now it's time to start thinking hyperparameters.
-Come up with some then run them by chatgpt.
-First, let's try context_len 1024.
-Then, let's do the same for context_len 2048.
+# TODO: consider getting rid of synchronize.
 
-# once we size transformer in VRAM, we should be able to make a good guess for our context_len
 
-Karpathy used these settings:
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
-T = 1024 # sequence length
-block_size: int = 1024 # max sequence length
-vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-n_layer: int = 12 # number of layers
-n_head: int = 12 # number of heads
-n_embd: int = 768 # embedding dimension
-
-double check: how many steps did Karpathy do?
-
-See if you can fit GPT-medium on your GPU: https://arxiv.org/pdf/2005.14165 (you're willing to train an epoch or two over 10 days.)
-
-All models were trained for a total of 300 billion tokens --> but remember you have high quality tokens.
-
-"""
 
 
 
@@ -123,7 +98,8 @@ print(f"using device {device}")
 PAD_TOKEN = None
 BOS_TOKEN = None
 EOS_TOKEN = None
-IGNORE_TOKEN = -100 # token that loss functions will ignore
+IGNORE_TOKEN = -100 # token that loss functions will ignore. 
+#This is not part of the tokenizer, but of the dataset objects, and it's passed on to them, so this is the source of truth setting.
 STAGE_PRETRAINING = "pretraining"
 STAGE_SFT = "sft"
 
@@ -163,7 +139,7 @@ def model_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     )
 
 @torch.no_grad()
-def accuracy_counts(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int = -100):
+def accuracy_counts(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int):
     pred = logits.argmax(dim=-1)
     valid = labels.ne(ignore_index)
     correct = (pred.eq(labels) & valid).sum()
@@ -197,35 +173,35 @@ def get_config_for_training_stage(training_stage):
         return {
         "weight_decay": 0.1,
         "learning_rate": 3e-4,
-        "min_lr": 1e-4, # TODO: you need to tune this
-        "batch_micro_size": 4, # tune this until you max out VRAM.
+        "min_lr": 3e-5, 
+        "batch_micro_size": 4, # that's all that fit in VRAM
         "batch_effective_size": 256, #2**19 tokens
         "num_epochs": 1,
         "num_blocks": 24,
         "dropout_rate": 0.1,
         "embed_dim": 1024,
-        "context_len": 2048, # if we can get to 2048 that will be preferrable
+        "context_len": 2048,
         "num_heads": 16,
-        "warmup_steps": 512 # TODO: tune this, (I think it's 2% of total steps?)
+        "warmup_steps": 720 # somewhere around 3% of expected totals.
     }
     elif training_stage == STAGE_SFT:
         return {
         "weight_decay": 0.1,
         "learning_rate": 3e-4,
-        "min_lr": 1e-4, # TODO: you need to tune this
-        "batch_micro_size": 32, # tune this until you max out VRAM.
-        "batch_effective_size": 512, #2**19 tokens
+        "min_lr": 3e-5, 
+        "batch_micro_size": 4, # that's all that fit in VRAM
+        "batch_effective_size": 256, #2**19 tokens
         "num_epochs": 1,
         "num_blocks": 24,
-        "dropout_rate": 0.0,
+        "dropout_rate": 0.1,
         "embed_dim": 1024,
-        "context_len": 2048, # if we can get to 2048 that will be preferrable
+        "context_len": 2048,
         "num_heads": 16,
-        "warmup_steps": 512 # TODO: tune this, (I think it's 2% of total steps?)
+        "warmup_steps": 650
     }
     raise ValueError(f"bad training stage {training_stage}")
 
-def get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, context_len, token_dtype):
+def get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, context_len, token_dtype, pad_token, ignore_token):
     if training_stage == STAGE_PRETRAINING:
         train_token_path = os.path.join(train_data_dir, "tokens.bin")
         train_index_path = os.path.join(train_data_dir, "sample_idx.bin")
@@ -235,15 +211,15 @@ def get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, context
         validation_set = IndexedLMDataset(val_token_path, val_index_path, context_len, token_dtype)
         return training_set, validation_set
     elif training_stage == STAGE_SFT:
-        training_set = SFTMemmapDatasetShifted(train_data_dir, context_len, PAD_TOKEN, IGNORE_TOKEN, token_dtype)
-        validation_set = SFTMemmapDatasetShifted(val_data_dir, context_len, PAD_TOKEN, IGNORE_TOKEN, token_dtype)
+        training_set = SFTMemmapDatasetShifted(train_data_dir, context_len, pad_token, ignore_token, token_dtype)
+        validation_set = SFTMemmapDatasetShifted(val_data_dir, context_len, pad_token, ignore_token, token_dtype)
         return training_set, validation_set
     raise ValueError(f"bad training stage {training_stage}")
 
 
 def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resume_name, resume_checkpoint):
     if training_stage ==  STAGE_SFT:
-        assert pretrained_name # if we are in SFT, there must be a corresponding pretrained model to start from.
+        assert pretrained_name and pretrained_checkpoint # if we are in SFT, there must be a corresponding pretrained model to start from.
 
     train_data_dir = "tokenized_pretrain_train_2048"
     val_data_dir = "tokenized_pretrain_validation_2048"
@@ -261,7 +237,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
     autocast_ctx = (
         torch.autocast(device_type=str(device), dtype=torch.bfloat16)
-        if str(device) == "cuda"
+        if (device.type == "cuda")
         else nullcontext()
     )
 
@@ -275,7 +251,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
         # IndexedLMDataset is a custom dataset that loads tokens from memory mapped .bin files. It will return x and y, both of length context_len.
         token_dtype = np.uint16 if tokenizer.vocab_size is not None and tokenizer.vocab_size <= 65535 else np.uint32
-        train_set, val_set = get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, C.context_len, token_dtype)
+        train_set, val_set = get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, C.context_len, token_dtype, PAD_TOKEN, IGNORE_TOKEN)
 
         # Create data loaders for our datasets; shuffle for training, not for validation
         # TODO: if gpu-util is not high enough, adjust settings (an example is above).
@@ -300,7 +276,8 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         optimizer = AdamW(
             param_groups(model, wd=C.weight_decay),
             lr=C.learning_rate,
-            betas=(0.9, 0.98),
+            betas=(0.9, 0.95),
+            eps=1e-8,
             fused=(fused_available and str(device) == "cuda"),
         )
 
@@ -327,14 +304,16 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
             )
             best_val = extra.get("best_val", best_val)
             print(f"Resumed from {ckpt_path} at epoch={start_epoch}, global_step={global_step}")
+            print("Resumed scheduler at step:", scheduler.last_epoch)
+            print("Resumed scheduler current LR:", scheduler.get_last_lr())
         elif training_stage == STAGE_SFT:
             # load from a pretrained model
             pretrained_save_dir=f"./{pretrained_name}_ckpts"
-            pretrained_ckpt_path = os.path.join(pretrained_save_dir, pretrained_checkpointain)
-            pretrained_ckpt = torch.load(pretrained_ckpt_path, map_location=str(device))
+            pretrained_ckpt_path = os.path.join(pretrained_save_dir, pretrained_checkpoint)
+            pretrained_ckpt = torch.load(pretrained_ckpt_path, map_location=device)
             model.load_state_dict(pretrained_ckpt["model"])
 
-        eval_and_save_every_steps = 100
+        eval_and_save_every_steps = 30
         print_every_steps = 1
 
         model.train()
@@ -356,22 +335,13 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 inputs = inputs.to(device, non_blocking=True).long()
                 labels = labels.to(device, non_blocking=True).long()
 
-                if micro_step == 0:
-                    assert (inputs != PAD_TOKEN).all(), "Found pad tokens in pretraining inputs"
-                    assert (inputs != IGNORE_TOKEN).all(), "Found unknowns in pretraining inputs"
-                    assert (inputs < tokenizer.vocab_size).all(), "Found out-of-range labels in pretraining inputs"
-                    assert (labels != PAD_TOKEN).all(), "Found pad tokens in pretraining labels"
-                    assert (labels != IGNORE_TOKEN).all(), "Found unknowns in pretraining labels"
-                    assert (labels < tokenizer.vocab_size).all(), "Found out-of-range labels in pretraining labels"
-                    print(f"assertion successful")
-
                 # Basic shape checks
                 assert inputs.dim() == 2 and labels.dim() == 2
                 assert inputs.size(1) == C.context_len, "context_len mismatch with pretokenized dataset"
 
                 with autocast_ctx:
                     logits = model(inputs)  # (B,T,V)
-                    loss = model_loss(logits, labels) / grad_accum
+                loss = model_loss(logits, labels) / grad_accum
 
                 loss.backward()
                 running_micro += 1
@@ -420,12 +390,12 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                             for inputs_v, labels_v in val_loader:
                                 inputs_v = inputs_v.to(device, non_blocking=True).long()
                                 labels_v = labels_v.to(device, non_blocking=True).long()
-                                assert (inputs_v != PAD_TOKEN).all() and (labels_v != PAD_TOKEN).all()
 
                                 logits_v = model(inputs_v)
                                 batch_loss = model_loss(logits_v, labels_v)
                                 val_loss_sum += batch_loss.item()
-                                acc_correct, acc_total = accuracy_counts(logits_v, labels_v)
+                                val_batches += 1
+                                acc_correct, acc_total = accuracy_counts(logits_v, labels_v, IGNORE_TOKEN)
                                 val_acc_correct += acc_correct
                                 val_acc_total += acc_total
 
