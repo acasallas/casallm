@@ -24,26 +24,32 @@ from transformers import PreTrainedTokenizerFast
 
 
 
-# first thing we gotta do is to do the deterministic shuffling for restarting checkpoints.
-# fix indexing so you can restart from checkpoints
-# absolute victory tonight would look like getting SFT and DPO completley running.
-# if you wanna leave it running overnight that would probably be fine. I'd like to do kv caching soon though.
+# set it up on huggingface spacs
+#hey, can you plot loss to wandb more often
+# train SFT and DPO on checkpoints, and test out their own checkpoint systems.
+# one of last things to do is to check how long validation takes and consider increasing the size of the batch.
 # step 2.1: make sure the checkpointing stuff works!
 # step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
 # TODO: before actual training run, make save checkpoints futher apart.
 # TODO: before actual training run, make wandb run names use real run names.
+# TODO: there's left truncate in two places for the SFT pipeline, I think you should remove one.
+# TODO: for sft you might have a different number of epochs? so pay attention to what you were told regarding leftover samples.
+
+# finish batched kv caching and inference, then start official training run!
+# next steps: todos for inference are largely in transformer.py actually
+
+# SFT/DPO filtering, todo's are in there.
 
 
 # todo later
 #------------
+# hyperparameters for SFT and DPO are here: https://chatgpt.com/c/68ad3875-80c8-832a-a62f-7e7948d85b71
 # make sure the lambdaLR scheduler is fine.
 # TODO: make sure what you wrote about the ignore token is true.
 # TODO: double check the reindex script was legit.
 # TODO: check for duplication between sft_test and gen_test.
 # later recommendation: Consider gradient checkpointing inside blocks if you push context length or model size.
 # TODO: consider getting rid of synchronize.
-
-
 
 
 if torch.cuda.is_available():
@@ -59,7 +65,6 @@ PAD_TOKEN = None
 BOS_TOKEN = None
 EOS_TOKEN = None
 IGNORE_TOKEN = -100 # token that loss functions will ignore. 
-#This is not part of the tokenizer, but of the dataset objects, and it's passed on to them, so this is the source of truth setting.
 STAGE_PRETRAINING = "pretraining"
 STAGE_SFT = "sft"
 
@@ -124,8 +129,9 @@ def resolve_run_name(run_name, resume_name):
         if os.path.isdir(save_dir):
             raise ValueError(f"Run name {run_name} cannot be created. Already exists on disk.")
         else:
+            os.makedirs(save_dir, exist_ok=True)
+            print(f"Creating directory for {run_name}.")
             return run_name, save_dir
-    raise ValueError("couldn't resolve run name")
 
 def get_config_for_training_stage(training_stage):
     if training_stage == STAGE_PRETRAINING:
@@ -145,27 +151,29 @@ def get_config_for_training_stage(training_stage):
     }
     elif training_stage == STAGE_SFT:
         return {
-        "weight_decay": 0.1,
-        "learning_rate": 3e-4,
-        "min_lr": 3e-5, 
+        "weight_decay": 0.05,
+        "learning_rate": 1e-4,
+        "min_lr": 1e-5, 
         "batch_micro_size": 4, # that's all that fit in VRAM
-        "batch_effective_size": 256, #2**19 tokens
+        "batch_effective_size": 128,
         "num_epochs": 1,
         "num_blocks": 24,
         "dropout_rate": 0.1,
         "embed_dim": 1024,
         "context_len": 2048,
         "num_heads": 16,
-        "warmup_steps": 650
+        "warmup_steps": 50 # TODO: this is for 200,000 samples, if you augment the dataset adjust it.
     }
     raise ValueError(f"bad training stage {training_stage}")
 
 def get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, context_len, token_dtype, pad_token, ignore_token):
     if training_stage == STAGE_PRETRAINING:
+        # get token path and index path from dir
         train_token_path = os.path.join(train_data_dir, "tokens.bin")
         train_index_path = os.path.join(train_data_dir, "sample_idx.bin")
         val_token_path = os.path.join(val_data_dir, "tokens.bin")
         val_index_path = os.path.join(val_data_dir, "sample_idx.bin")
+
         training_set = IndexedLMDataset(train_token_path, train_index_path, context_len, token_dtype)
         validation_set = IndexedLMDataset(val_token_path, val_index_path, context_len, token_dtype)
         return training_set, validation_set
@@ -183,16 +191,11 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
     train_data_dir = "tokenized_pretrain_train_2048"
     val_data_dir = "tokenized_pretrain_validation_2048"
     tokenizer_dir = "casallm_bpe"
-    # assert you set these
-    assert train_data_dir and val_data_dir and tokenizer_dir
 
     config = get_config_for_training_stage(training_stage)
     assert config['batch_effective_size'] % config['batch_micro_size'] == 0
 
-    print(f"run name we want {run_name}")
     run_name, save_dir = resolve_run_name(run_name, resume_name)
-
-    print(f"run name is {run_name} in {save_dir}.")
 
     autocast_ctx = (
         torch.autocast(device_type=str(device), dtype=torch.bfloat16)
@@ -212,16 +215,13 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         token_dtype = np.uint16 if tokenizer.vocab_size is not None and tokenizer.vocab_size <= 65535 else np.uint32
         train_set, val_set = get_datasets_for_stage(training_stage, train_data_dir, val_data_dir, C.context_len, token_dtype, PAD_TOKEN, IGNORE_TOKEN)
 
-        # Create data loaders for our datasets; shuffle for training, not for validation
-        # TODO: if gpu-util is not high enough, adjust settings (an example is above).
-        train_loader = torch.utils.data.DataLoader(
-            train_set, batch_size=C.batch_micro_size, shuffle=True,
-            drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True,
-        )
-        val_loader = torch.utils.data.DataLoader(
-            val_set, batch_size=C.batch_micro_size, shuffle=False,
-            num_workers=2, pin_memory=True, persistent_workers=True,
-        )
+        full_dataset_num_microbatches = len(train_set)//C.batch_micro_size
+
+        # use a deterministically shuffled order to be able to continue between run
+        # this works because we're just training one epoch.
+        rng = np.random.default_rng(seed=12345) 
+        perm = rng.permutation(len(train_set))
+        
 
         # the forward() function of the transformer takes input_ids: (B, T) and returns logits # (B, T, vocab_size)
         print(f"vocab size is gonna be: {tokenizer.vocab_size}")
@@ -261,7 +261,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
         # LR schedule: warmup + cosine on optimizer steps
         grad_accum = C.batch_effective_size // C.batch_micro_size
-        steps_per_epoch = math.ceil(len(train_loader) / grad_accum)
+        steps_per_epoch = math.ceil(full_dataset_num_microbatches / grad_accum)
         total_steps = steps_per_epoch * C.num_epochs
 
         def lr_lambda(step):
@@ -273,6 +273,8 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+        previous_micro_step = 0
+
         # Resume
         start_epoch, global_step, best_val = 0, 0, float("inf")
         if resume_name:
@@ -281,6 +283,9 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 ckpt_path, model, optimizer, scheduler, map_location=str(device)
             )
             best_val = extra.get("best_val", best_val)
+            previous_micro_step = extra.get("micro_step", 0)
+            start_sample = previous_micro_step * C.batch_micro_size
+            perm = perm[start_sample:] # set train_set perm array to start at new index.
             print(f"Resumed from {ckpt_path} at epoch={start_epoch}, global_step={global_step}")
             print("Resumed scheduler at step:", scheduler.last_epoch)
             print("Resumed scheduler current LR:", scheduler.get_last_lr())
@@ -291,22 +296,38 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
             pretrained_ckpt = torch.load(pretrained_ckpt_path, map_location=device)
             model.load_state_dict(pretrained_ckpt["model"])
 
-        eval_and_save_every_steps = 30 # TODO: this will be higher soon
+
+        # Create data loaders for our datasets
+        train_set.set_permutation_array(perm)
+        train_loader = torch.utils.data.DataLoader(
+            train_set, batch_size=C.batch_micro_size, shuffle=False,
+            drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_set, batch_size=C.batch_micro_size, shuffle=False,
+            num_workers=2, pin_memory=True, persistent_workers=True,
+        )
+
+        eval_every_steps = 30 # TODO: this will be higher soon (we want it like every 15 min.)
+        save_every_steps = 30 # TODO: this is gonna be very high, like every hour
         print_every_steps = 1
         num_val_micro_batches = 2*C.batch_effective_size//C.batch_micro_size # we'll run two size batches for validation
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
+        # Note: running_micro is a counter for each micro batch that is never reset, it increases forever.
+        # We set it to previous_micro_step when we are resuming because we will only resuming on training runs that last 1 epoch.
+        # If we wanted to resume on training runs that last more than 1 epoch (like SFT, or if we decided to pretrain longer, this logic would have to become a bit more complex).
+        running_micro = previous_micro_step
         last_print_time = time.time()
-        running_micro = 0
 
         for epoch in range(start_epoch, C.num_epochs):
             print(f"\nEPOCH {epoch}")
             running_loss_sum = 0.0
             running_batches = 0
 
-            for micro_step, (inputs, labels) in enumerate(train_loader):
+            for micro_step, (inputs, labels) in enumerate(train_loader, start=previous_micro_step):
                 # Start a new accumulation window when the *global* micro step hits a boundary
                 if running_micro % grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
@@ -350,15 +371,15 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         return # early exit for now.
 
                     # periodic eval + checkpoint
-                    if global_step % eval_and_save_every_steps == 0:
+                    if global_step % save_every_steps == 0:
                         ckpt_path = os.path.join(save_dir, f"step_{global_step}.pth")
                         save_checkpoint(
                             ckpt_path, model, optimizer, scheduler, epoch, global_step,
-                            extra={"best_val": best_val}
+                            extra={"best_val": best_val, "micro_step": micro_step}
                         )
                         print(f"Saved checkpoint: {ckpt_path}")
 
-                        # Eval
+                    if global_step % eval_every_steps == 0:
                         model.eval()
                         val_loss_sum = 0.0
                         val_batches = 0
@@ -383,6 +404,15 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         val_loss = val_loss_sum / max(1, val_batches)
                         val_acc = val_acc_correct / max(1, val_acc_total)
                         print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
+
+                        if global_step > 50000 and val_loss < best_val: # don't start saving every best val until we are deep into training.
+                            best_val = val_loss
+                            ckpt_path = os.path.join(save_dir, f"best_val.pth")
+                            save_checkpoint(
+                                ckpt_path, model, optimizer, scheduler, epoch, global_step,
+                                extra={"best_val": best_val, "micro_step": micro_step}
+                            )
+                            print(f"Saved checkpoint: {ckpt_path}")
 
                         wandb.log({
                             "epoch": epoch,

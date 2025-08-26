@@ -15,10 +15,12 @@ import wandb
 
 from common_utils import save_checkpoint, load_checkpoint
 from transformer import Transformer
-from lmdataset import DPODataset
+from lmdataset import DPODataset, dpo_collate
+
+from transformers import PreTrainedTokenizerFast
+from functools import partial
 
 
-# TODO: in dpo preprocessing, remember to split up training and validation split.
 if torch.cuda.is_available():
     device = torch.device("cuda")
 elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
@@ -26,8 +28,10 @@ elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
 else:
     device = torch.device("cpu")
 
-PAD_TOKEN = 0
-IGNORE_TOKEN = -100 # token that loss functions will ignore
+PAD_TOKEN = None
+BOS_TOKEN = None
+EOS_TOKEN = None
+IGNORE_TOKEN = -100 
 
 # use NVIDIA's tf32.
 torch.set_float32_matmul_precision('high')
@@ -68,11 +72,12 @@ def resolve_run_name(run_name, resume_name):
         if os.path.isdir(save_dir):
             raise ValueError(f"Run name {run_name} cannot be created. Already exists on disk.")
         else:
+            os.makedirs(save_dir, exist_ok=True)
             print(f"Creating directory for {run_name}.")
             return run_name, save_dir
 
 
-def seq_logprobs_from_logits(logits, labels, ignore_index=-100, length_normalize=False):
+def seq_logprobs_from_logits(logits, labels, ignore_index, length_normalize):
     """
     logits: (B, T, V)
     labels: (B, T) with ignore_index for tokens to ignore (e.g., prompt/pad)
@@ -99,7 +104,7 @@ def dpo_loss(
     chosen_logits, rejected_logits,
     ref_chosen_logits, ref_rejected_logits,
     chosen_labels, rejected_labels,
-    beta, ignore_index=-100, length_normalize=False
+    beta, ignore_index, length_normalize
 ):
     """
     Returns: scalar loss = mean over pairs of -logsigmoid(beta * ((Δ_theta) - (Δ_ref)))
@@ -126,39 +131,37 @@ def dpo_loss(
 def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
     assert run_name and sft_name and sft_checkpoint # Required: these must be set.
 
-    train_data_dir = ""
-    val_data_dir = ""
-    tokenizer_dir = "" # TODO: set these
-
-    # assert you set these
-    assert train_data_dir and val_data_dir and tokenizer_dir
+    train_data_dir = "tokenized_dpo_train_2048"
+    val_data_dir = "tokenized_dpo_validation_2048"
+    tokenizer_dir = "casallm_bpe"
 
     # TODO: set all these hyperparameters
     config = {
-        "weight_decay": 0.1,
-        "learning_rate": 3e-4,
-        "min_lr": 1e-4, # TODO: you need to tune this
-        "batch_micro_size": 64, # tune this until you max out VRAM.
-        "batch_effective_size": 512, #2**19 tokens
-        "num_epochs": 1,
+        "weight_decay": 0.01,
+        "learning_rate": 1.5e-5,
+        "min_lr": 1.2e-5,
+        "batch_micro_size": 4, # tune this until you max out VRAM.
+        "batch_effective_size": 64, #2**19 tokens
+        "num_epochs": 3,
         "num_blocks": 24,
         "dropout_rate": 0.1,
         "embed_dim": 1024,
-        "context_len": 1024, # if we can get to 2048 that will be preferrable
+        "context_len": 2048, # if we can get to 2048 that will be preferrable
         "num_heads": 16,
         "warmup_steps": 1000, # TODO: tune this, (I think it's 2% of total steps?)
-        "beta": 0.5 # TODO: look up what this should be
+        "beta": 0.1,
+        "length_normalize": True
     }
 
-    assert config.batch_effective_size % config.batch_micro_size == 0
+    assert config["batch_effective_size"] % config["batch_micro_size"] == 0
 
     sft_save_dir=f"./{sft_name}_ckpts"
     sft_ckpt_path = os.path.join(sft_save_dir, sft_checkpoint)
     run_name, save_dir = resolve_run_name(run_name, resume_name)
 
     autocast_ctx = (
-        torch.autocast(device_type=device_type, dtype=torch.bfloat16)
-        if device_type == "cuda"
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        if device.type == "cuda"
         else nullcontext()
     )
 
@@ -166,29 +169,28 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
         C = wandb.config
 
         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_dir)
+        PAD_TOKEN = tokenizer.pad_token_id
+        BOS_TOKEN = tokenizer.bos_token_id
+        EOS_TOKEN = tokenizer.eos_token_id
 
-        # TODO: why did SFT and pretrain dataset require the uint16 thing and DPO doesn't, is it because of index shuffling?
         training_set = DPODataset(train_data_dir)
         validation_set = DPODataset(val_data_dir)
 
+        collate = partial(dpo_collate, pad_id=PAD_TOKEN, max_len=2048, min_prompt_tokens=1, eos_id=EOS_TOKEN, ignore_id = IGNORE_TOKEN)
+
         # Create data loaders for our datasets; shuffle for training, not for validation
-        # TODO: if gpu-util is not high enough, adjust settings (an example is above).
         train_loader = torch.utils.data.DataLoader(
             training_set, batch_size=C.batch_micro_size, shuffle=True,
-            drop_last=True, num_workers=8, pin_memory=True, persistent_workers=True,
+            drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True, collate_fn=collate
         )
         val_loader = torch.utils.data.DataLoader(
             validation_set, batch_size=C.batch_micro_size, shuffle=False,
-            num_workers=2, pin_memory=True, persistent_workers=True,
+            num_workers=2, pin_memory=True, persistent_workers=True, collate_fn=collate
         )
 
         # the forward() function of the transformer takes input_ids: (B, T) and returns logits # (B, T, vocab_size)
-        model = Transformer(tokenizer.vocab_size, wandb.config.embed_dim, wandb.config.context_len, wandb.config.num_heads, wandb.config.dropout_rate, wandb.config.num_blocks, PAD_TOKEN)
+        model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, wandb.config.num_heads, C.dropout_rate, C.num_blocks, PAD_TOKEN)
         model.to(device)
-
-        # let's see number of model parameters
-        model.eval()
-        summary(model, input_size=(4, C.context_len))
 
         # Optimizer (fused if available on CUDA)
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
@@ -196,7 +198,7 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
             param_groups(model, wd=C.weight_decay),
             lr=C.learning_rate,
             betas=(0.9, 0.98),
-            fused=(fused_available and device_type == "cuda"),
+            fused=(fused_available and device.type == "cuda"),
         )
 
         # LR schedule: warmup + cosine on optimizer steps
@@ -228,11 +230,15 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
             model.load_state_dict(sft_ckpt["model"])
 
         # load the reference model from the sft directory.
-        ref_model = Transformer(tokenizer.vocab_size, wandb.config.embed_dim, wandb.config.context_len, wandb.config.num_heads, wandb.config.dropout_rate, wandb.config.num_blocks, PAD_TOKEN)
+        ref_model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, wandb.config.num_heads, C.dropout_rate, C.num_blocks, PAD_TOKEN)
         ref_model.to(device)
         sft_ckpt = torch.load(sft_ckpt_path, map_location=str(device))
         ref_model.load_state_dict(sft_ckpt["model"])
-        # TODO: ref_model should be in eval()?
+
+        # freeze ref_model
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
 
         eval_and_save_every_steps = 100
         print_every_steps = 10
@@ -256,43 +262,33 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                 if running_micro % grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
 
-                inputs = batch["input_ids"]
-                labels = batch["labels"]
-
-                inputs = inputs.to(device, non_blocking=True).long()
-                labels = labels.to(device, non_blocking=True).long()
-
-                # TODO: I think the below is unnecessary because the dataset already returns them like this?
-                inp = input_ids.view(-1, T)        # (2B, T)
-                lbl = labels.view(-1, T)           # (2B, T)
+                inputs = batch["input_ids"].to(device, non_blocking=True).long() # (2B, T)
+                labels = batch["labels"].to(device, non_blocking=True).long() # (2B, T)
+                is_chosen = batch["is_chosen"].to(device, non_blocking=True).bool()
 
                 with autocast_ctx:
                     with torch.no_grad():
-                        ref_logits = ref_model(inp)    # (2B, T, V)
-                    logits = model(inp)                # (2B, T, V)
+                        ref_logits = ref_model(inputs)    # (2B, T, V)
+                    logits = model(inputs)                # (2B, T, V)
 
-                    # reshape back to pair-major
-                    logits = logits.view(B, 2, T, V)
-                    ref_logits = ref_logits.view(B, 2, T, V)
-
-                    # split chosen/rejected along axis=1
-                    chosen_logits   = logits[:, 0]
-                    rejected_logits = logits[:, 1]
-                    ref_chosen_logits   = ref_logits[:, 0]
-                    ref_rejected_logits = ref_logits[:, 1]
-                    chosen_labels = labels[:, 0]
-                    rejected_labels = labels[:, 1]
+                    # Split into chosen/rejected
+                    chosen_logits   = logits[is_chosen]        # (B/2,T,V)
+                    rejected_logits = logits[~is_chosen]       # (B/2,T,V)
+                    chosen_labels   = labels[is_chosen]            # (B/2,T)
+                    rejected_labels = labels[~is_chosen]           # (B/2,T)
+                    ref_chosen_logits   = ref_logits[is_chosen]    # (B/2,T,V)
+                    ref_rejected_logits = ref_logits[~is_chosen]   # (B/2,T,V)
 
                     loss = dpo_loss(chosen_logits, rejected_logits,
                                     ref_chosen_logits, ref_rejected_logits,
-                                    chosen_labels, rejected_labels)
+                                    chosen_labels, rejected_labels, C.beta, IGNORE_TOKEN, C.length_normalize)
 
                 loss.backward()
                 running_micro += 1
 
                 # end of accumulation window -> step
                 if running_micro % grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), C.clip_norm)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     scheduler.step()
                     global_step += 1
@@ -300,19 +296,19 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                     # lightweight train loss logging (per optimizer step)
                     running_loss_sum += loss.item() * grad_accum  # undo /grad_accum for readability
                     running_batches += 1
-                    if global_step % print_every == 0 and running_batches > 0:
+                    if global_step % print_every_steps == 0 and running_batches > 0:
                         if device.type == "cuda":
                             torch.cuda.synchronize()
                         now = time.time()  # or datetime.now() if you prefer
                         dt = now - last_print_time
                         last_print_time = now
-                        tok_per_step = C.batch_effective_size * context_len * grad_accum
+                        tok_per_step = C.batch_effective_size * C.context_len
                         tok_per_sec = (print_every * tok_per_step) / max(dt, 1e-9)
                         avg_loss = running_loss_sum / running_batches
                         print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e")
 
                     # periodic eval + checkpoint
-                    if global_step % eval_every == 0:
+                    if global_step % eval_and_save_every_steps == 0:
                         ckpt_path = os.path.join(save_dir, f"step_{global_step}.pth")
                         save_checkpoint(
                             ckpt_path, model, optimizer, scheduler, epoch, global_step,
@@ -322,72 +318,66 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
 
                         # Eval
                         model.eval()
-                        running_val_loss_sum = 0.0
-                        running_val_sample_count = 0
-                        running_val_acc_sum = 0.0
-                        running_val_acc_ref_sum = 0.0
+                        val_loss_sum = 0.0
+                        val_pairs_sum = 0
+                        acc_sum = 0.0
+                        acc_ref_sum = 0.0
 
-                        # TODO: this is the correct canonical DPO accuracy measure, figure it out.
                         with torch.no_grad():
-                            for batch in val_loader:
-                                inputs_v = batch["input_ids"]
-                                labels = batch["labels"]
-                                inputs_v = inputs_v.to(device, non_blocking=True).long()
-                                labels_v = labels_v.to(device, non_blocking=True).long()
-                                # TODO: I think we're already in (2B, T format.)
+                            for batch_v in val_loader:
+                                inputs_v = batch_v["input_ids"].to(device, non_blocking=True).long()
+                                labels_v = batch_v["labels"].to(device, non_blocking=True).long()
+                                is_chosen_v = batch_v["is_chosen"].to(device, non_blocking=True).bool()
 
-                                ref_logits = ref_model(inp)    # (2B, T, V)
-                                logits = model(inp)                # (2B, T, V)
+                                ref_logits_v = ref_model(inputs_v)
+                                logits_v = model(inputs_v)
 
-                                # reshape back to pair-major
-                                logits = logits.view(B, 2, T, V)
-                                ref_logits = ref_logits.view(B, 2, T, V)
+                                ch_logits = logits_v[is_chosen_v]
+                                rj_logits = logits_v[~is_chosen_v]
+                                ch_labels = labels_v[is_chosen_v]
+                                rj_labels = labels_v[~is_chosen_v]
 
-                                # split chosen/rejected along axis=1
-                                chosen_logits   = logits[:, 0]
-                                rejected_logits = logits[:, 1]
-                                ref_chosen_logits   = ref_logits[:, 0]
-                                ref_rejected_logits = ref_logits[:, 1]
-                                chosen_labels = labels[:, 0]
-                                rejected_labels = labels[:, 1]
+                                ref_ch_logits = ref_logits_v[is_chosen_v]
+                                ref_rj_logits = ref_logits_v[~is_chosen_v]
 
-                                # logits_*: (B_pairs, T, V); labels_*: (B_pairs, T) with -100 outside response
-                                lp_c   = seq_logprobs_from_logits(chosen_logits,   chosen_labels)    # (B_pairs,)
-                                lp_r   = seq_logprobs_from_logits(rejected_logits, rejected_labels)  # (B_pairs,)
-                                delta  = lp_c - lp_r                                                 # (B_pairs,)
+                                # DPO loss
+                                val_loss = dpo_loss(
+                                    ch_logits, rj_logits,
+                                    ref_ch_logits, ref_rj_logits,
+                                    ch_labels, rj_labels,
+                                    C.beta, IGNORE_TOKEN, C.length_normalize,
+                                )
+                                val_loss_sum += val_loss.item()
 
-                                # Plain pairwise accuracy
-                                acc = (delta > 0).float().mean()
+                                # Pairwise accuracy (policy preferred)
+                                lp_c = seq_logprobs_from_logits(ch_logits, ch_labels, IGNORE_TOKEN, C.length_normalize)
+                                lp_r = seq_logprobs_from_logits(rj_logits, rj_labels, IGNORE_TOKEN, C.length_normalize)
+                                delta = lp_c - lp_r
+                                acc = (delta > 0).float().mean().item()
+                                acc_sum += acc
 
-                                # also calc ref-normalized accuracy
-                                rlp_c  = seq_logprobs_from_logits(ref_chosen_logits,   chosen_labels)
-                                rlp_r  = seq_logprobs_from_logits(ref_rejected_logits, rejected_labels)
-                                s      = beta * ((delta) - (rlp_c - rlp_r))
-                                acc_ref    = (s > 0).float().mean()
-                                pref_prob  = torch.sigmoid(s).mean()
-                                val_dpo    = (-torch.nn.functional.logsigmoid(s)).mean()
+                                # Ref-normalized signal (optional diagnostics)
+                                rlp_c = seq_logprobs_from_logits(ref_ch_logits, ch_labels, IGNORE_TOKEN, C.length_normalize)
+                                rlp_r = seq_logprobs_from_logits(ref_rj_logits, rj_labels, IGNORE_TOKEN, C.length_normalize)
+                                s = C.beta * (delta - (rlp_c - rlp_r))
+                                acc_ref = (s > 0).float().mean().item()
+                                acc_ref_sum += acc_ref
 
+                                # count pairs in this batch
+                                batch_pairs = ch_logits.size(0)
+                                val_pairs_sum += 1  # averaging per-batch metrics above
 
-                                loss = dpo_loss(chosen_logits, rejected_logits,
-                                    ref_chosen_logits, ref_rejected_logits,
-                                    chosen_labels, rejected_labels)
-
-                                running_val_sample_count += inputs_v.size(0)
-                                running_val_loss_sum += loss.item()*running_val_sample_count
-                                running_val_acc_sum += acc*val_sample_count
-                                running_val_acc_ref_sum += acc_ref*val_sample_count
-
-                        val_loss = running_val_loss_sum / max(1, running_val_sample_count)
-                        val_acc = running_val_acc_sum / max(1, running_val_sample_count)
-                        val_acc_ref = running_val_acc_ref_sum / max(1, running_val_sample_count)
+                        mean_val_loss = val_loss_sum / max(1, val_pairs_sum)
+                        mean_val_acc = acc_sum / max(1, val_pairs_sum)
+                        mean_val_acc_ref = acc_ref_sum / max(1, val_pairs_sum)
                         print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
 
                         wandb.log({
                             "epoch": epoch,
                             "global_step": global_step,
-                            "val_loss": val_loss,
-                            "val_acc": val_acc,
-                            "": val_acc_ref,
+                            "val_loss": mean_val_loss,
+                            "val_acc": mean_val_acc,
+                            "val_acc_ref": mean_val_acc_ref,
                             "lr": scheduler.get_last_lr()[0],
                             "train_loss": running_loss_sum / running_batches
                         })

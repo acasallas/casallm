@@ -12,14 +12,8 @@ from tqdm import tqdm
 
 
 
-
-
-
 # Reminder: we're gonna use both sft and gen splits in the ultrachat dataset for sft.
-
-# TODO: let's analyze the ultrachat_200k dataset
-# does it have "who are you" type questions. If not inject them and say you are CasaLLM.
-
+# TODO: search the sft dataset for "who are you" type questions.
 
 # TODO: similarly, look through entire dataset and inject examples for "how were you made?" and "what are you?", "who made you", "why were you made."
 
@@ -36,11 +30,6 @@ from tqdm import tqdm
 
 # TODO: put in some responses to gibberish or non-English language (I don't understand your input, can you write it in English?)
 # be careful with the above but I think it should be fine.
-
-# TODO: let's see if a left truncate is necessary. If it's not we can remove left truncate code from lmdataset.py
-# and he put left truncate in two places!
-
-
 
 """
 train_sft bad items:
