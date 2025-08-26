@@ -23,8 +23,6 @@ from lmdataset import IndexedLMDataset, SFTMemmapDatasetShifted
 from transformers import PreTrainedTokenizerFast
 
 
-
-# set it up on huggingface spacs
 #hey, can you plot loss to wandb more often
 # train SFT and DPO on checkpoints, and test out their own checkpoint systems.
 # one of last things to do is to check how long validation takes and consider increasing the size of the batch.
@@ -34,11 +32,14 @@ from transformers import PreTrainedTokenizerFast
 # TODO: before actual training run, make wandb run names use real run names.
 # TODO: there's left truncate in two places for the SFT pipeline, I think you should remove one.
 # TODO: for sft you might have a different number of epochs? so pay attention to what you were told regarding leftover samples.
+# TODO: the lenghts of DPO tokenization looked suspicious. take a closer look on your laptop to see what went wrong.
 
 # finish batched kv caching and inference, then start official training run!
 # next steps: todos for inference are largely in transformer.py actually
 
 # SFT/DPO filtering, todo's are in there.
+
+# set it up on huggingface spacs
 
 
 # todo later
