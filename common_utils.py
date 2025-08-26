@@ -25,17 +25,25 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, global_step, extra
     torch.save(ckpt, path)
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, map_location="cuda"):
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt and ckpt["optimizer"] is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and "scheduler" in ckpt and ckpt["scheduler"] is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
-    # restore random number generator - seems like a good idea
+    # ---- Restore RNG states safely ----
     if "torch_rng_state" in ckpt:
-        torch.set_rng_state(ckpt["torch_rng_state"])
+        # must be a CPU ByteTensor
+        torch.set_rng_state(ckpt["torch_rng_state"].cpu())
+
     if "cuda_rng_state" in ckpt and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+        states = ckpt["cuda_rng_state"]
+        # handle both list-of-tensors (usual) and a single tensor (defensive)
+        if isinstance(states, torch.Tensor):
+            states = [states]
+        # torch.cuda.set_rng_state_all expects CPU ByteTensors as well
+        torch.cuda.set_rng_state_all([t.cpu() for t in states])
+
     if "numpy_rng_state" in ckpt:
         np.random.set_state(ckpt["numpy_rng_state"])
     if "python_rng_state" in ckpt:

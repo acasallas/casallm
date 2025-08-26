@@ -50,6 +50,7 @@ from transformers import PreTrainedTokenizerFast
 # TODO: check for duplication between sft_test and gen_test.
 # later recommendation: Consider gradient checkpointing inside blocks if you push context length or model size.
 # TODO: consider getting rid of synchronize.
+# consider saving micro_batch+1 to save dict instead (so it's all "where to start off on next load")
 
 
 if torch.cuda.is_available():
@@ -203,7 +204,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         else nullcontext()
     )
 
-    with wandb.init(config=config, project=f"casallm-{training_stage}",entity="alancasallas-self") as run: #for now, let's use fun wandb names: ,name=run_name) as run:
+    with wandb.init(mode="disabled",config=config, project=f"casallm-{training_stage}",entity="alancasallas-self") as run: #for now, let's use fun wandb names: ,name=run_name) as run:
         C = wandb.config
 
         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_dir)
@@ -221,7 +222,8 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         # this works because we're just training one epoch.
         rng = np.random.default_rng(seed=12345) 
         perm = rng.permutation(len(train_set))
-        
+
+        print(f"some perm values: {perm[26654]} {perm[9747]} {perm[256885]}")
 
         # the forward() function of the transformer takes input_ids: (B, T) and returns logits # (B, T, vocab_size)
         print(f"vocab size is gonna be: {tokenizer.vocab_size}")
@@ -273,7 +275,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-        previous_micro_step = 0
+        start_micro = 0
 
         # Resume
         start_epoch, global_step, best_val = 0, 0, float("inf")
@@ -283,10 +285,10 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 ckpt_path, model, optimizer, scheduler, map_location=str(device)
             )
             best_val = extra.get("best_val", best_val)
-            previous_micro_step = extra.get("micro_step", 0)
-            start_sample = previous_micro_step * C.batch_micro_size
+            start_micro = extra.get("micro_step")+1 #add one to last completed step
+            start_sample = start_micro * C.batch_micro_size
             perm = perm[start_sample:] # set train_set perm array to start at new index.
-            print(f"Resumed from {ckpt_path} at epoch={start_epoch}, global_step={global_step}")
+            print(f"Resumed from {ckpt_path} at epoch={start_epoch}, global_step={global_step} micro_step={start_micro}")
             print("Resumed scheduler at step:", scheduler.last_epoch)
             print("Resumed scheduler current LR:", scheduler.get_last_lr())
         elif training_stage == STAGE_SFT:
@@ -308,8 +310,8 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
             num_workers=2, pin_memory=True, persistent_workers=True,
         )
 
-        eval_every_steps = 30 # TODO: this will be higher soon (we want it like every 15 min.)
-        save_every_steps = 30 # TODO: this is gonna be very high, like every hour
+        eval_every_steps = 20 # TODO: this will be higher soon (we want it like every 15 min.)
+        save_every_steps = 20 # TODO: this is gonna be very high, like every hour
         print_every_steps = 1
         num_val_micro_batches = 2*C.batch_effective_size//C.batch_micro_size # we'll run two size batches for validation
 
@@ -317,9 +319,9 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         optimizer.zero_grad(set_to_none=True)
 
         # Note: running_micro is a counter for each micro batch that is never reset, it increases forever.
-        # We set it to previous_micro_step when we are resuming because we will only resuming on training runs that last 1 epoch.
+        # We set it to start_micro when we are resuming because we will only resuming on training runs that last 1 epoch.
         # If we wanted to resume on training runs that last more than 1 epoch (like SFT, or if we decided to pretrain longer, this logic would have to become a bit more complex).
-        running_micro = previous_micro_step
+        running_micro = start_micro
         last_print_time = time.time()
 
         for epoch in range(start_epoch, C.num_epochs):
@@ -327,7 +329,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
             running_loss_sum = 0.0
             running_batches = 0
 
-            for micro_step, (inputs, labels) in enumerate(train_loader, start=previous_micro_step):
+            for micro_step, (inputs, labels) in enumerate(train_loader, start=start_micro):
                 # Start a new accumulation window when the *global* micro step hits a boundary
                 if running_micro % grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
@@ -367,7 +369,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         avg_loss = running_loss_sum / running_batches
                         print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e}")
 
-                    if global_step > 32:
+                    if global_step > 25:
                         return # early exit for now.
 
                     # periodic eval + checkpoint
@@ -380,6 +382,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         print(f"Saved checkpoint: {ckpt_path}")
 
                     if global_step % eval_every_steps == 0:
+                        ts_val = time.time()
                         model.eval()
                         val_loss_sum = 0.0
                         val_batches = 0
@@ -403,7 +406,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
                         val_loss = val_loss_sum / max(1, val_batches)
                         val_acc = val_acc_correct / max(1, val_acc_total)
-                        print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
+                        print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f} | val elapsed time (sec) {time.time()-ts_val:.4f}")
 
                         if global_step > 50000 and val_loss < best_val: # don't start saving every best val until we are deep into training.
                             best_val = val_loss

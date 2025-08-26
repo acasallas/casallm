@@ -184,7 +184,7 @@ def main():
         num_proc=args.num_proc or None,
         desc="Tokenizing DPO pairs",
         fn_kwargs=fn_kwargs,
-        remove_columns=[col for col in ds.column_names if col not in ("system","input","chosen","rejected")],
+        remove_columns=ds.column_names,
     )
 
     # 5) Set features explicitly
