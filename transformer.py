@@ -26,12 +26,13 @@ def forward(self, x, *, past_kv=None, use_cache=False, **kw):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id):
+    def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id, use_attn_mask):
         super().__init__()
         assert embed_dim % num_heads == 0
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.use_attn_mask = use_attn_mask
 
         self.QKV_proj = nn.Linear(embed_dim, embed_dim * 3, bias=False)
         self.mh_linear = nn.Linear(embed_dim, embed_dim, bias=True)
@@ -79,22 +80,30 @@ class MultiHeadAttention(nn.Module):
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
 
-        # Build attention bias: (B, 1, T, T) -> broadcasts over heads
-        # Start with causal lower triangle; mask (set -inf) outside it.
-        attn_bias = torch.zeros((B, 1, T, T), dtype=x.dtype, device=x.device)
-        causal = self.causal_mask[:T, :T]  # (T, T) bool
-        attn_bias = attn_bias.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float("-inf"))
+        if self.use_attn_mask:
+            # Build attention bias: (B, 1, T, T) -> broadcasts over heads
+            # Start with causal lower triangle; mask (set -inf) outside it.
+            attn_bias = torch.zeros((B, 1, T, T), dtype=x.dtype, device=x.device)
+            causal = self.causal_mask[:T, :T]  # (T, T) bool
+            attn_bias = attn_bias.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-        # we only mask keys. queries be masked later, in the loss (otherwise we'll have softmaxes with denominator of 0).
-        key_keep = (input_ids != self.pad_token_id).to(x.device)  # (B, T) bool
-        attn_bias = attn_bias.masked_fill(~key_keep[:, None, None, :], float("-inf"))
+            # we only mask keys. queries be masked later, in the loss (otherwise we'll have softmaxes with denominator of 0).
+            key_keep = (input_ids != self.pad_token_id).to(x.device)  # (B, T) bool
+            attn_bias = attn_bias.masked_fill(~key_keep[:, None, None, :], float("-inf"))
 
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_bias,                  # additive mask
-            dropout_p=self.attn_head_dropout_rate if self.training else 0.0,
-            is_causal=False
-        )
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_bias,                  # additive mask
+                dropout_p=self.attn_head_dropout_rate if self.training else 0.0,
+                is_causal=False
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.attn_head_dropout_rate if self.training else 0.0,
+                is_causal=True
+            )
 
         # concat heads and project
         y = y.transpose(1, 2).contiguous().view(B, T, E)
@@ -105,10 +114,10 @@ class MultiHeadAttention(nn.Module):
         
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id):
+    def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id, use_attn_mask):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
-        self.mha = MultiHeadAttention(embed_dim, num_heads, dropout_rate, context_len, pad_token_id)
+        self.mha = MultiHeadAttention(embed_dim, num_heads, dropout_rate, context_len, pad_token_id, use_attn_mask)
 
         self.ln2 = nn.LayerNorm(embed_dim)
         self.mlp1 = nn.Linear(embed_dim, embed_dim * 4, bias=True)
@@ -125,7 +134,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, vocab_size, embed_dim, context_len, num_heads, dropout_rate, n_blocks, pad_token_id):
+    def __init__(self, vocab_size, embed_dim, context_len, num_heads, dropout_rate, n_blocks, pad_token_id, is_pretraining):
         super().__init__()
         assert embed_dim % num_heads == 0
         self.embed_dim = embed_dim
@@ -138,9 +147,9 @@ class Transformer(nn.Module):
 
         # RoPE tables: (T, Dh/2)
         self._prepare_rope_tables(context_len, self.head_dim)
-
+        
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, dropout_rate, context_len, pad_token_id)
+            TransformerBlock(embed_dim, num_heads, dropout_rate, context_len, pad_token_id, not is_pretraining) # when pretraining we can use SDPA's fast path rather than build our own mask
             for _ in range(n_blocks)
         ])
         self.output_layernorm = nn.LayerNorm(embed_dim)

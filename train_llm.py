@@ -27,6 +27,11 @@ from transformers import PreTrainedTokenizerFast
 # fix validation so it doesn't take too long
 # fix indexing so you can restart from checkpoints
 # but before you do that, you'll have to activate torch.compile
+# absolute victory tonight would look like getting SFT and DPO completley running.
+# if you wanna leave it running overnight that would probably be fine. I'd like to do kv caching soon though.
+
+# tommorow, you're gonna flip the script: you're doing mostly leetcode, and a bit of LLM stuff when you're tired.
+
 # step 2.1: make sure the checkpointing stuff works!
 # step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
 
