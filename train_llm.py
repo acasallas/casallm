@@ -346,7 +346,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         avg_loss = running_loss_sum / running_batches
                         print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e}")
 
-                    if global_step > 30:
+                    if global_step > 32:
                         return # early exit for now.
 
                     # periodic eval + checkpoint
