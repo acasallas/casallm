@@ -290,10 +290,28 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
         # the forward() function of the transformer takes input_ids: (B, T) and returns logits # (B, T, vocab_size)
         print(f"vocab size is gonna be: {tokenizer.vocab_size}")
+        print(f"but tokenizer len is {len(tokenizer)}")
         model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, C.num_heads, C.dropout_rate, C.num_blocks, PAD_TOKEN)
-        model.eval()
-        summary(model, input_size=(4, C.context_len), dtypes=[torch.long])
+
+        # This code was added because torchinfo.summary was double-counting tied weights.
+        # 1) Prove it’s the same tensor
+        print(model.output.weight is model.embedding.weight)  # -> True
+        print(id(model.output.weight) == id(model.embedding.weight))  # -> True
+
+        # 2) Count “true” parameters without double-counting shared objects
+        seen = set()
+        true_params = 0
+        for p in model.parameters():
+            if id(p) not in seen:
+                seen.add(id(p))
+                true_params += p.numel()
+        print(f"True parameter count: {true_params:,}")
+
+        #model.eval()
+        #summary(model, input_size=(4, C.context_len), dtypes=[torch.long])
         model.to(device)
+
+        model = torch.compile(model)
 
         # Optimizer (fused if available on CUDA)
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
@@ -397,7 +415,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         avg_loss = running_loss_sum / running_batches
                         print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e}")
 
-                    if global_step > 1:
+                    if global_step > 3:
                         return # early exit for now.
 
                     # periodic eval + checkpoint
