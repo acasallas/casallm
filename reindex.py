@@ -18,15 +18,19 @@ def main():
 
     # read old meta just to get dtype/vocab; tokens.bin itself is independent of context
     old_meta = json.load(open(bin_dir/"meta.json"))
-    dtype = np.uint16 if old_meta["dtype"] == "uint16" else np.uint32
-
+    dtype = np.uint16 if old_meta["dtype"] == "numpy.uint16" else np.uint32
+    print(f"dtype is {dtype}")
     tokens_path = bin_dir/"tokens.bin"
     nbytes = os.path.getsize(tokens_path)
     n_tokens = nbytes // np.dtype(dtype).itemsize
 
+    print(f"n_tokens {n_tokens}")
+
     ctx = args.context_len
     stride = args.stride or ctx
     seq = ctx + 1
+
+    print(f"stride {stride}")
 
     # build starts
     if n_tokens >= seq:

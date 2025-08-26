@@ -230,9 +230,9 @@ def main():
                     help="Pre-truncate each sample to this many tokens (left-truncate).")
     args = ap.parse_args()
 
-    if ap.split == "train":
+    if args.split == "train":
         split = "train_sft"
-    elif ap.split == "validation":
+    elif args.split == "validation":
         split = "test_sft"
 
     ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=split)
@@ -268,7 +268,7 @@ def main():
     pbar = tqdm(ds, desc="Tokenizing SFT samples", unit="sample")
     for ex in pbar:
         messages = ex["messages"]
-        messages.insert(0, {"content": random.sample(system_prompts), "role": "system"})
+        messages.insert(0, {"content": random.sample(system_prompts,1)[0], "role": "system"})
 
         ids, lmask = encode_chat_to_ids_and_mask(messages, tok)
 

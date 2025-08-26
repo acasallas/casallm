@@ -13,20 +13,18 @@ from datasets import load_from_disk
 # TODO: we still should go through all our data examples and see if any exceed context_length (which you still don't know if they will be 1024 or 2048)
 # clamp_shared_prompt() is a function that could be removed if all examples fit the context_length.
 
-# TODO: next step right now is to get DPO training loop ready
-# TODO: then why don't you get the model loading stuff ready.
+
 
 # TODO: then at last it's time for the kv cache lol
 
-# TODO: then it's leetcode time.
 
 
 class IndexedLMDataset(torch.utils.data.Dataset):
-    def __init__(self, token_path, index_path, dtype):
+    def __init__(self, token_path, index_path, context_len, dtype):
         self.token_path = token_path
         self.index_path = index_path
         self.dtype = dtype
-        self.seq = 1025
+        self.seq = context_len+1
 
         # Lazily open memmaps in worker process to avoid big pickles
         self._tokens = None
