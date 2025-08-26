@@ -24,71 +24,26 @@ from transformers import PreTrainedTokenizerFast
 
 
 
-# fix validation so it doesn't take too long
+# first thing we gotta do is to do the deterministic shuffling for restarting checkpoints.
 # fix indexing so you can restart from checkpoints
-# but before you do that, you'll have to activate torch.compile
 # absolute victory tonight would look like getting SFT and DPO completley running.
 # if you wanna leave it running overnight that would probably be fine. I'd like to do kv caching soon though.
-
-# tommorow, you're gonna flip the script: you're doing mostly leetcode, and a bit of LLM stuff when you're tired.
-
 # step 2.1: make sure the checkpointing stuff works!
 # step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
-
+# TODO: before actual training run, make save checkpoints futher apart.
+# TODO: before actual training run, make wandb run names use real run names.
 
 
 # todo later
 #------------
 # make sure the lambdaLR scheduler is fine.
 # TODO: make sure what you wrote about the ignore token is true.
-
-
-
-
-
 # TODO: double check the reindex script was legit.
-
-
-#TODO: check for duplication between sft_test and gen_test.
-
+# TODO: check for duplication between sft_test and gen_test.
+# later recommendation: Consider gradient checkpointing inside blocks if you push context length or model size.
 # TODO: consider getting rid of synchronize.
 
 
-
-
-
-# later recommendation: Consider gradient checkpointing inside blocks if you push context length or model size.
-
-
-"""
-Potential DataLoader settings to play around with:
-
-train_loader = DataLoader(
-    train_set,
-    batch_size=C.batch_micro_size,
-    shuffle=True,
-    drop_last=True,
-    num_workers=12,                 # start ~12–16; tune
-    prefetch_factor=4,              # default=2; bump if RAM allows
-    pin_memory=True,
-    pin_memory_device="cuda",       # PyTorch ≥2.1
-    persistent_workers=True,
-    multiprocessing_context="fork", # Linux/WSL; try "forkserver" if RAM spikes
-    worker_init_fn=lambda _: torch.set_num_threads(1),  # avoid BLAS thread storms
-)
-
-val_loader = DataLoader(
-    val_set,
-    batch_size=C.batch_micro_size,
-    shuffle=False,
-    num_workers=2,                  # small; eval is bursty
-    prefetch_factor=2,
-    pin_memory=True,
-    pin_memory_device="cuda",
-    persistent_workers=True,
-    worker_init_fn=lambda _: torch.set_num_threads(1),
-)
-"""
 
 
 if torch.cuda.is_available():
@@ -169,7 +124,6 @@ def resolve_run_name(run_name, resume_name):
         if os.path.isdir(save_dir):
             raise ValueError(f"Run name {run_name} cannot be created. Already exists on disk.")
         else:
-            print(f"Creating directory for {run_name}.")
             return run_name, save_dir
     raise ValueError("couldn't resolve run name")
 
@@ -246,7 +200,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         else nullcontext()
     )
 
-    with wandb.init(mode="disabled",config=config, project=f"casallm-{training_stage}",entity="alancasallas-self",name=run_name) as run:
+    with wandb.init(config=config, project=f"casallm-{training_stage}",entity="alancasallas-self") as run: #for now, let's use fun wandb names: ,name=run_name) as run:
         C = wandb.config
 
         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_dir)
@@ -337,8 +291,9 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
             pretrained_ckpt = torch.load(pretrained_ckpt_path, map_location=device)
             model.load_state_dict(pretrained_ckpt["model"])
 
-        eval_and_save_every_steps = 30
+        eval_and_save_every_steps = 30 # TODO: this will be higher soon
         print_every_steps = 1
+        num_val_micro_batches = 2*C.batch_effective_size//C.batch_micro_size # we'll run two size batches for validation
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -391,7 +346,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         avg_loss = running_loss_sum / running_batches
                         print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e}")
 
-                    if global_step > 3:
+                    if global_step > 30:
                         return # early exit for now.
 
                     # periodic eval + checkpoint
@@ -422,6 +377,8 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                                 acc_correct, acc_total = accuracy_counts(logits_v, labels_v, IGNORE_TOKEN)
                                 val_acc_correct += acc_correct
                                 val_acc_total += acc_total
+                                if val_batches >= num_val_micro_batches:
+                                    break
 
                         val_loss = val_loss_sum / max(1, val_batches)
                         val_acc = val_acc_correct / max(1, val_acc_total)
