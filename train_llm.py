@@ -23,9 +23,9 @@ from lmdataset import IndexedLMDataset, SFTMemmapDatasetShifted
 from transformers import PreTrainedTokenizerFast
 
 
-#hey, can you plot loss to wandb more often
+# TODO: update huggingface spaces to make sure kv cache works fine.
+
 # train SFT and DPO on checkpoints, and test out their own checkpoint systems.
-# one of last things to do is to check how long validation takes and consider increasing the size of the batch.
 # step 2.1: make sure the checkpointing stuff works!
 # TODO: the lenghts of DPO tokenization looked suspicious. take a closer look on your laptop to see what went wrong.
 # step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
@@ -35,12 +35,9 @@ from transformers import PreTrainedTokenizerFast
 # TODO: for sft you might have a different number of epochs? so pay attention to what you were told regarding leftover samples.
 
 
-# finish batched kv caching and inference, then start official training run!
-# next steps: todos for inference are largely in transformer.py actually
 
 # SFT/DPO filtering, todo's are in there.
 
-# set it up on huggingface spacs
 
 
 # todo later
@@ -231,8 +228,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         print(f"some perm values: {perm[26654]} {perm[9747]} {perm[256885]}")
 
         # the forward() function of the transformer takes input_ids: (B, T) and returns logits # (B, T, vocab_size)
-        print(f"vocab size is gonna be: {tokenizer.vocab_size}")
-        print(f"but tokenizer len is {len(tokenizer)}")
+        print(f"vocab size is gonna be: {tokenizer.vocab_size} and tokenizer len is {len(tokenizer)}")
         model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, C.num_heads, C.dropout_rate, C.num_blocks, 
             PAD_TOKEN, training_stage == STAGE_PRETRAINING)
 
@@ -315,10 +311,12 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
             num_workers=2, pin_memory=True, persistent_workers=True,
         )
 
-        eval_every_steps = 20 # TODO: this will be higher soon (we want it like every 15 min.)
-        save_every_steps = 20 # TODO: this is gonna be very high, like every hour
+        # for pretraining, at 50,000 tok/s, we're doing about 6 steps per minute
+        eval_every_steps = 90 # about every 15 min.
+        save_every_steps = 360 # bout every hour
+        log_train_every_steps = 5
         print_every_steps = 1
-        num_val_micro_batches = 2*C.batch_effective_size//C.batch_micro_size # we'll run two size batches for validation
+        num_val_micro_batches = 4*C.batch_effective_size//C.batch_micro_size # we'll run two size batches for validation
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -342,6 +340,23 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 # Start a new accumulation window when the *global* micro step hits a boundary
                 if running_micro % grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
+
+                if micro_step == 0 or micro_step == 1:
+                    B = inputs.size(0)
+                    for s in range(B):
+                        print("input:")
+                        ids_in = inputs[s].tolist()
+                        print(ids_in)  # raw integers
+                        print(tokenizer.convert_ids_to_tokens(ids_in))
+                        print(tokenizer.decode(ids_in))
+                        print("\n")
+
+                        print("label:")
+                        ids_lab = [i for i in labels[s].tolist() if i != IGNORE_TOKEN]
+                        print(ids_lab)  # raw integers (ignore_index removed)
+                        print(tokenizer.convert_ids_to_tokens(ids_lab))
+                        print(tokenizer.decode(ids_lab))
+                        print("\n")
 
                 inputs = inputs.to(device, non_blocking=True).long()
                 labels = labels.to(device, non_blocking=True).long()
@@ -380,7 +395,16 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         avg_loss = running_loss_sum / running_batches
                         print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e}")
 
-                    if global_step > 25:
+                    if global_step % log_train_every_steps == 0:
+                        wandb.log({
+                            "train_global_step": global_step,
+                            "lr": scheduler.get_last_lr()[0],
+                            "train_loss": running_loss_sum / running_batches
+                        })
+                        running_loss_sum = 0.0
+                        running_batches = 0
+
+                    if global_step > 1:
                         return # early exit for now.
 
                     # periodic eval + checkpoint
@@ -419,7 +443,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         val_acc = val_acc_correct / max(1, val_acc_total)
                         print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f} | val elapsed time (sec) {time.time()-ts_val:.4f}")
 
-                        if global_step > 50000 and val_loss < best_val: # don't start saving every best val until we are deep into training.
+                        if global_step > 5000 and val_loss < best_val: # don't start saving every best val until we are deep into training.
                             best_val = val_loss
                             ckpt_path = os.path.join(save_dir, f"best_val.pth")
                             save_checkpoint(
@@ -429,15 +453,10 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                             print(f"Saved checkpoint: {ckpt_path}")
 
                         wandb.log({
-                            "epoch": epoch,
-                            "global_step": global_step,
+                            "val_global_step": global_step,
                             "val_loss": val_loss,
-                            "val_acc": val_acc,
-                            "lr": scheduler.get_last_lr()[0],
-                            "train_loss": running_loss_sum / running_batches
+                            "val_acc": val_acc
                         })
-                        running_loss_sum = 0.0
-                        running_batches = 0
                         model.train()
 
 if __name__ == "__main__":
