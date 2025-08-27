@@ -27,12 +27,13 @@ from transformers import PreTrainedTokenizerFast
 # train SFT and DPO on checkpoints, and test out their own checkpoint systems.
 # one of last things to do is to check how long validation takes and consider increasing the size of the batch.
 # step 2.1: make sure the checkpointing stuff works!
+# TODO: the lenghts of DPO tokenization looked suspicious. take a closer look on your laptop to see what went wrong.
 # step 2: before you train, do a sanity check where you load data and reverse the tokenization to make sure it looks like real language.
 # TODO: before actual training run, make save checkpoints futher apart.
 # TODO: before actual training run, make wandb run names use real run names.
 # TODO: there's left truncate in two places for the SFT pipeline, I think you should remove one.
 # TODO: for sft you might have a different number of epochs? so pay attention to what you were told regarding leftover samples.
-# TODO: the lenghts of DPO tokenization looked suspicious. take a closer look on your laptop to see what went wrong.
+
 
 # finish batched kv caching and inference, then start official training run!
 # next steps: todos for inference are largely in transformer.py actually
@@ -346,7 +347,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 assert inputs.size(1) == C.context_len, "context_len mismatch with pretokenized dataset"
 
                 with autocast_ctx:
-                    logits = model(inputs)  # (B,T,V)
+                    logits = model(inputs, False, None, None, None)  # (B,T,V)
                 loss = model_loss(logits, labels) / grad_accum
 
                 loss.backward()
@@ -398,7 +399,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                                 inputs_v = inputs_v.to(device, non_blocking=True).long()
                                 labels_v = labels_v.to(device, non_blocking=True).long()
 
-                                logits_v = model(inputs_v)
+                                logits_v = model(inputs_v, False, None, None, None)
                                 batch_loss = model_loss(logits_v, labels_v)
                                 val_loss_sum += batch_loss.item()
                                 val_batches += 1
