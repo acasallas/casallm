@@ -18,7 +18,7 @@ from contextlib import nullcontext
 import wandb
 
 from common_utils import save_checkpoint, load_checkpoint
-from transformer import Transformer
+from transformer import Transformer, TransformerBlock
 from lmdataset import IndexedLMDataset, SFTMemmapDatasetShifted
 from transformers import PreTrainedTokenizerFast
 
@@ -329,6 +329,10 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         running_micro = start_micro
         last_print_time = time.time()
 
+        # kv caching is not used for any stage of training.
+        unused_k_cache = [None for _ in range(C.num_blocks)]
+        unused_v_cache = [None for _ in range(C.num_blocks)]
+
         for epoch in range(start_epoch, C.num_epochs):
             print(f"\nEPOCH {epoch}")
             running_loss_sum = 0.0
@@ -343,11 +347,13 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 labels = labels.to(device, non_blocking=True).long()
 
                 # Basic shape checks
+                #print(f"input shape is {inputs.size()}")
+                #print(f"labels shape is {labels.size()}")
                 assert inputs.dim() == 2 and labels.dim() == 2
                 assert inputs.size(1) == C.context_len, "context_len mismatch with pretokenized dataset"
 
                 with autocast_ctx:
-                    logits = model(inputs, False, None, None, None)  # (B,T,V)
+                    logits = model(inputs, False, None, unused_k_cache, unused_v_cache)  # (B,T,V)
                 loss = model_loss(logits, labels) / grad_accum
 
                 loss.backward()
@@ -399,7 +405,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                                 inputs_v = inputs_v.to(device, non_blocking=True).long()
                                 labels_v = labels_v.to(device, non_blocking=True).long()
 
-                                logits_v = model(inputs_v, False, None, None, None)
+                                logits_v = model(inputs_v, False, None, unused_k_cache, unused_v_cache)
                                 batch_loss = model_loss(logits_v, labels_v)
                                 val_loss_sum += batch_loss.item()
                                 val_batches += 1

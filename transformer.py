@@ -166,6 +166,7 @@ class MultiHeadAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout_rate, context_len, pad_token_id, use_attn_mask):
         super().__init__()
+
         self.ln1 = nn.LayerNorm(embed_dim)
         self.mha = MultiHeadAttention(embed_dim, num_heads, dropout_rate, context_len, pad_token_id, use_attn_mask)
 
@@ -176,8 +177,15 @@ class TransformerBlock(nn.Module):
         self.ff_dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x, input_ids, cos_table, sin_table, use_cache, pos, k_cache, v_cache, cache_kv):
+
         x = x + self.mha(self.ln1(x), input_ids, cos_table, sin_table, use_cache, pos, k_cache, v_cache, cache_kv)
-        x = x + self.ff_dropout(self.mlp2(F.gelu(self.ln2(x))))
+
+        h = self.ln2(x)                       # (B,T,E)
+        h = self.mlp1(h)                      # (B,T,4E)
+        h = F.gelu(h)
+        h = self.ff_dropout(self.mlp2(h))     # (B,T,E)
+
+        x = x + h
         return x
 
 
