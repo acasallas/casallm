@@ -266,6 +266,27 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                 labels = batch["labels"].to(device, non_blocking=True).long() # (2B, T)
                 is_chosen = batch["is_chosen"].to(device, non_blocking=True).bool()
 
+                if micro_step == 0 or micro_step == 1:
+                    B = inputs.size(0)
+                    for s in range(B):
+                        print("input:")
+                        ids_in = inputs[s].tolist()
+                        print(ids_in)  # raw integers
+                        print(tokenizer.convert_ids_to_tokens(ids_in))
+                        print(tokenizer.decode(ids_in))
+                        print("\n")
+
+                        print("label:")
+                        ids_lab = [i for i in labels[s].tolist() if i != IGNORE_TOKEN]
+                        print(ids_lab)  # raw integers (ignore_index removed)
+                        print(tokenizer.convert_ids_to_tokens(ids_lab))
+                        print(tokenizer.decode(ids_lab))
+                        print("\n")
+
+                        print("is_chosen:")
+                        is_chosen_ids = [i for i in is_chosen[s].tolist()]
+                        print(is_chosen_ids)
+
                 with autocast_ctx:
                     with torch.no_grad():
                         ref_logits = ref_model(inputs, False, None, None, None)    # (2B, T, V)
