@@ -61,7 +61,7 @@ class IndexedLMDataset(torch.utils.data.Dataset):
         self.perm = perm
 
 
-
+# TODO: your preprocessing script is broken!!! I guess it shouldn't know anything about context_len.
 
 class SFTMemmapDatasetShifted(Dataset):
     """
@@ -71,14 +71,14 @@ class SFTMemmapDatasetShifted(Dataset):
       - sample_idx.bin  : uint64 pairs (offset, length) per sample
       - meta.json       : optional sanity (pad_token_id, dtype, context_len)
 
-    Returns (like your pretraining dataset):
-      - x: (context_len-1,) int64  = input_ids[:-1]
-      - y: (context_len-1,) int64  = input_ids[1:] with ignore_index where target token
+    Returns
+      - x: (context_len,) int64  = input_ids[:-1]
+      - y: (context_len,) int64  = input_ids[1:] with ignore_index where target token
                                     is NOT assistant content or is padding.
     """
     def __init__(self, data_dir, context_len, pad_token_id, ignore_index, dtype_str):
         self.data_dir = Path(data_dir)
-        self.context_len = int(context_len)
+        self.seq_len = int(context_len)+1
         self.pad_id = int(pad_token_id)
         self.ignore_index = int(ignore_index)
         self.dtype = np.dtype(dtype_str)
@@ -89,7 +89,7 @@ class SFTMemmapDatasetShifted(Dataset):
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             if "dtype" in meta:
-                self.dtype = np.dtype(meta["dtype"])
+                self.dtype = np.dtype(meta["dtype"].split(".")[1]) # 'numpy.uint16' -> 'uint16'
             if "pad_token_id" in meta:
                 self.pad_id = int(meta["pad_token_id"])
             # context_len here is explicit in __init__; we keep it
@@ -101,6 +101,7 @@ class SFTMemmapDatasetShifted(Dataset):
         self._tokens = None
         self._mask = None
         self._idx = None
+        self.perm = None
 
     def _ensure_open(self):
         if self._tokens is None:
@@ -117,31 +118,33 @@ class SFTMemmapDatasetShifted(Dataset):
 
     def __len__(self):
         self._ensure_open()
-        return self._idx.shape[0]
+        return len(self.perm) if self.perm is not None else self._idx.shape[0]
 
     def _slice_and_fit(self, offset: int, length: int):
-        """Get a single sample, then left-truncate/pad to context_len."""
+        """Get a single sample, then left-truncate/pad to seq_len."""
         s = int(offset); e = s + int(length)
         ids = self._tokens[s:e]  # views
         msk = self._mask[s:e]
 
-        # Left-truncate if necessary (keep last context_len tokens)
+        # Left-truncate if necessary (keep last seq_len tokens)
         # TODO: this logic (left padding) is already done in pre-tokenization and is a candidate for deletion.
-        if len(ids) > self.context_len:
-            ids = ids[-self.context_len:]
-            msk = msk[-self.context_len:]
-        # Pad to context_len if short
-        elif len(ids) < self.context_len:
-            pad_len = self.context_len - len(ids)
+        if len(ids) > self.seq_len:
+            ids = ids[-self.seq_len:]
+            msk = msk[-self.seq_len:]
+        # Pad to seq_len if short
+        elif len(ids) < self.seq_len:
+            pad_len = self.seq_len - len(ids)
             ids = np.concatenate([ids, np.full(pad_len, self.pad_id, dtype=self._tokens.dtype)])
             msk = np.concatenate([msk, np.zeros(pad_len, dtype=np.uint8)])
 
-        assert len(ids) == self.context_len and len(msk) == self.context_len
+        assert len(ids) == self.seq_len and len(msk) == self.seq_len
         return ids, msk
 
     def __getitem__(self, idx):
         self._ensure_open()
-        off, length = self._idx[idx]
+        # remap through permutation if provided
+        real_idx = int(self.perm[idx]) if self.perm is not None else idx
+        off, length = self._idx[real_idx]
         ids, msk = self._slice_and_fit(off, length)
 
         # Build x = ids[:-1]
@@ -163,6 +166,9 @@ class SFTMemmapDatasetShifted(Dataset):
         x = torch.as_tensor(x_np).clone()
         y = torch.as_tensor(y_np).clone()
         return x, y
+
+    def set_permutation_array(self, perm):
+        self.perm = perm
 
 
 @dataclass
