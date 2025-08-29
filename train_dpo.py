@@ -252,6 +252,10 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
         last_print_time = time.time()
         running_micro = 0
 
+        # kv caching is not used for any stage of training.
+        unused_k_cache = [None for _ in range(C.num_blocks)]
+        unused_v_cache = [None for _ in range(C.num_blocks)]
+
         for epoch in range(start_epoch, C.num_epochs):
             print(f"\nEPOCH {epoch}")
             running_loss_sum = 0.0
@@ -289,8 +293,8 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
 
                 with autocast_ctx:
                     with torch.no_grad():
-                        ref_logits = ref_model(inputs, False, None, None, None)    # (2B, T, V)
-                    logits = model(inputs, False, None, None, None)                # (2B, T, V)
+                        ref_logits = ref_model(inputs, False, None, unused_k_cache, unused_v_cache)    # (2B, T, V)
+                    logits = model(inputs, False, None, unused_k_cache, unused_v_cache)                # (2B, T, V)
 
                     # Split into chosen/rejected
                     chosen_logits   = logits[is_chosen]        # (B/2,T,V)
@@ -350,8 +354,8 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                                 labels_v = batch_v["labels"].to(device, non_blocking=True).long()
                                 is_chosen_v = batch_v["is_chosen"].to(device, non_blocking=True).bool()
 
-                                ref_logits_v = ref_model(inputs_v, False, None, None, None)
-                                logits_v = model(inputs_v,False, None, None, None)
+                                ref_logits_v = ref_model(inputs_v, False, None, unused_k_cache, unused_v_cache)
+                                logits_v = model(inputs_v,False, None, unused_k_cache, unused_v_cache)
 
                                 ch_logits = logits_v[is_chosen_v]
                                 rj_logits = logits_v[~is_chosen_v]

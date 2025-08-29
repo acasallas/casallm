@@ -164,7 +164,8 @@ def encode_chat_to_ids_and_mask(messages: List[Dict[str, str]], tok: PreTrainedT
     <|assistant|>...
     </s>
 
-    Return token ids and loss_mask (1 on assistant *content* tokens only).
+    Return token ids and loss_mask (1 on assistant *content* tokens only,
+    plus the EOS sequence).
     """
     enc = tok.encode
     ids: List[int] = []
@@ -199,9 +200,9 @@ def encode_chat_to_ids_and_mask(messages: List[Dict[str, str]], tok: PreTrainedT
         else:
             raise ValueError(f"Unexpected role: {role}")
 
-    # EOS
+    # EOS (now supervised)
     eos_ids = tok.encode("\n" + SPECIAL_TOKENS["eos"], add_special_tokens=False)
-    ids.extend(eos_ids); mask.extend([0] * len(eos_ids))
+    ids.extend(eos_ids); mask.extend([1] * len(eos_ids))
 
     assert len(ids) == len(mask)
     return ids, mask
@@ -222,6 +223,7 @@ def main():
     ap.add_argument("--context_len", type=int, default=2048,
                     help="Pre-truncate each sample to this many tokens (left-truncate).")
     args = ap.parse_args()
+    
 
     if args.split == "train":
         split = "train_sft"
@@ -267,7 +269,7 @@ def main():
 
         lengths.append(len(ids))
 
-        ids, lmask = left_truncate(ids, lmask, args.context_len)
+        ids, lmask = left_truncate(ids, lmask, args.context_len+1)
 
         # Write tokens
         arr = np.asarray(ids, dtype=token_dtype)
@@ -285,7 +287,7 @@ def main():
 
     tok_f.close(); mask_f.close(); idx_f.close()
 
-    print(f"Final report on sample lengths: mean {np.mean(lengths)} std {np.std(lengths)} min {np.min(lengths)} max {np.max(lengths)}")
+    print(f"Final report on sample lengths: mean {np.mean(lengths)} std {np.std(lengths)} min {np.min(lengths)} max {np.max(lengths)} num greater than context_len {len([l for l in lengths if l > int(args.context_len)])/len(lengths)}")
 
     meta = {
         "dtype": str(token_dtype).split("'")[1],  # "uint16" or "uint32"

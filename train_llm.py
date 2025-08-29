@@ -18,7 +18,7 @@ from contextlib import nullcontext
 import wandb
 
 from common_utils import save_checkpoint, load_checkpoint
-from transformer import Transformer
+from transformer import Transformer, TransformerBlock
 from lmdataset import IndexedLMDataset, SFTMemmapDatasetShifted
 from transformers import PreTrainedTokenizerFast
 
@@ -217,7 +217,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         else nullcontext()
     )
 
-    with wandb.init(mode="disabled",config=config, project=f"casallm-{training_stage}",entity="alancasallas-self") as run: #for now, let's use fun wandb names: ,name=run_name) as run:
+    with wandb.init(config=config, project=f"casallm-{training_stage}",entity="alancasallas-self", name=run_name) as run: #for now, let's use fun wandb names: ) as run:
         C = wandb.config
 
         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_dir)
@@ -236,7 +236,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         rng = np.random.default_rng(seed=12345) 
         perm = rng.permutation(len(train_set))
 
-        print(f"some perm values: {perm[26654]} {perm[9747]} {perm[256885]}")
+        #print(f"some perm values: {perm[26654]} {perm[9747]} {perm[256885]}")
 
         # the forward() function of the transformer takes input_ids: (B, T) and returns logits # (B, T, vocab_size)
         print(f"vocab size is gonna be: {tokenizer.vocab_size} and tokenizer len is {len(tokenizer)}")
@@ -338,6 +338,10 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         running_micro = start_micro
         last_print_time = time.time()
 
+        # kv caching is not used for any stage of training.
+        unused_k_cache = [None for _ in range(C.num_blocks)]
+        unused_v_cache = [None for _ in range(C.num_blocks)]
+
         for epoch in range(start_epoch, C.num_epochs):
             print(f"\nEPOCH {epoch}")
             running_loss_sum = 0.0
@@ -348,32 +352,39 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 if running_micro % grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
 
-                if micro_step == 0 or micro_step == 1:
+                """
+                Sanity checking data, currently commented out.
+                if micro_step <16:
                     B = inputs.size(0)
                     for s in range(B):
-                        print("input:")
                         ids_in = inputs[s].tolist()
-                        print(ids_in)  # raw integers
-                        print(tokenizer.convert_ids_to_tokens(ids_in))
-                        print(tokenizer.decode(ids_in))
-                        print("\n")
+                        if ids_in[0] != 0:
+                            print("input:")
+                            print(ids_in)  # raw integers
+                            print(tokenizer.convert_ids_to_tokens(ids_in))
+                            print(tokenizer.decode(ids_in))
+                            print("\n")
 
-                        print("label:")
-                        ids_lab = [i for i in labels[s].tolist() if i != IGNORE_TOKEN]
-                        print(ids_lab)  # raw integers (ignore_index removed)
-                        print(tokenizer.convert_ids_to_tokens(ids_lab))
-                        print(tokenizer.decode(ids_lab))
-                        print("\n")
+                            print("label:")
+                            ids_lab = [i for i in labels[s].tolist()]
+                            print(ids_lab)  # raw integers (ignore_index removed)
+                            ids_lab = [i for i in labels[s].tolist() if i != IGNORE_TOKEN]
+                            print(tokenizer.convert_ids_to_tokens(ids_lab))
+                            print(tokenizer.decode(ids_lab))
+                            print("\n")
+                """
 
                 inputs = inputs.to(device, non_blocking=True).long()
                 labels = labels.to(device, non_blocking=True).long()
 
                 # Basic shape checks
+                #print(f"input shape is {inputs.size()}")
+                #print(f"labels shape is {labels.size()}")
                 assert inputs.dim() == 2 and labels.dim() == 2
-                assert inputs.size(1) == C.context_len, "context_len mismatch with pretokenized dataset"
+                assert inputs.size(1) == C.context_len, f"context_len {C.context_len} mismatch with pretokenized dataset {inputs.size()} for that matter labels size is {labels.size()}"
 
                 with autocast_ctx:
-                    logits = model(inputs, False, None, None, None)  # (B,T,V)
+                    logits = model(inputs, False, None, unused_k_cache, unused_v_cache)  # (B,T,V)
                 loss = model_loss(logits, labels) / grad_accum
 
                 loss.backward()
@@ -409,9 +420,6 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         running_loss_sum = 0.0
                         running_batches = 0
 
-                    if global_step > 1:
-                        return # early exit for now.
-
                     # periodic eval + checkpoint
                     if global_step % save_every_steps == 0:
                         ckpt_path = os.path.join(save_dir, f"step_{global_step}.pth")
@@ -434,7 +442,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                                 inputs_v = inputs_v.to(device, non_blocking=True).long()
                                 labels_v = labels_v.to(device, non_blocking=True).long()
 
-                                logits_v = model(inputs_v, False, None, None, None)
+                                logits_v = model(inputs_v, False, None, unused_k_cache, unused_v_cache)
                                 batch_loss = model_loss(logits_v, labels_v)
                                 val_loss_sum += batch_loss.item()
                                 val_batches += 1
