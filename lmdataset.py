@@ -202,7 +202,7 @@ def dpo_collate(
     ignore_id: int,
     max_len: int,
     min_prompt_tokens: int = 1,
-    eos_id: Optional[int] = None,
+    eos_id: int,
 ) -> Dict[str, torch.Tensor]:
     """
     Build a (2B, T) batch in [chosen, rejected] order per pair.
@@ -229,7 +229,7 @@ def dpo_collate(
 
         def build_seq(resp):
             s = p_shared + resp
-            if eos_id is not None and len(s) < T:
+            if len(s) < T:
                 s = s + [eos_id]
             return s
 

@@ -23,7 +23,18 @@ from lmdataset import IndexedLMDataset, SFTMemmapDatasetShifted
 from transformers import PreTrainedTokenizerFast
 
 
+
+# Friday:
+# you also need to make sure the app is templating things correctly, double check it!
+
+
+
 # TODO: update huggingface spaces to make sure kv cache works fine.
+
+# TODO: you are NOT ready to train DPO, masking was off in SFT and you might need to change it in DPO.
+# i think you add eos at the end but make sure you also have the needed /n in there.
+
+
 
 # train SFT and DPO on checkpoints, and test out their own checkpoint systems.
 # step 2.1: make sure the checkpointing stuff works!
