@@ -207,8 +207,8 @@ def dpo_collate(
     pad_id: int,
     ignore_id: int,
     max_len: int,
-    min_prompt_tokens: int = 1,
     eos_id: int,
+    min_prompt_tokens: int = 1,
 ) -> Dict[str, torch.Tensor]:
     """
     Build a (2B, T) batch in [chosen, rejected] order per pair.

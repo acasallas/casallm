@@ -163,7 +163,7 @@ def get_config_for_training_stage(training_stage):
     elif training_stage == STAGE_SFT:
         return {
         "weight_decay": 0.05,
-        "learning_rate": 1e-4,
+        "learning_rate": 5e-5,
         "min_lr": 1e-5, 
         "batch_micro_size": 4, # that's all that fit in VRAM
         "batch_effective_size": 128,
@@ -279,6 +279,8 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         total_steps = steps_per_epoch * C.num_epochs
 
         def lr_lambda(step):
+            min_lr_ratio = C.min_lr / C.learning_rate
+            return min_lr_ratio #TODO: change
             if step < C.warmup_steps:
                 return float(step + 1) / float(max(1, C.warmup_steps))
             t = (step - C.warmup_steps) / float(max(1, total_steps - C.warmup_steps))
@@ -312,19 +314,23 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
 
         # Create data loaders for our datasets
-        train_set.set_permutation_array(perm)
+        #train_set.set_permutation_array(perm) # TODO temporary: commenting out for SFT. Let's use switches later.
+        if training_stage == STAGE_PRETRAINING:
+            raise ValueError("fix the above")
         train_loader = torch.utils.data.DataLoader(
-            train_set, batch_size=C.batch_micro_size, shuffle=False,
+            train_set, batch_size=C.batch_micro_size, shuffle=True,
             drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True,
         )
+        # TODO: tmp workaround: SFT was lagging during val
         val_loader = torch.utils.data.DataLoader(
-            val_set, batch_size=C.batch_micro_size, shuffle=False,
+            val_set, batch_size=C.batch_micro_size//2, shuffle=False,
             num_workers=2, pin_memory=True, persistent_workers=True,
         )
 
         # for pretraining, at 50,000 tok/s, we're doing about 6 steps per minute
-        eval_every_steps = 90 # about every 15 min.
-        save_every_steps = 360 # bout every hour
+        # for sft, we're at 30,000 tok/s and each step in # of samples is half the size of pretrain sample size, so also about 6 steps per minute.
+        eval_every_steps = 30 # about every 10 min.
+        save_every_steps = 180 # bout every half hour
         log_train_every_steps = 5
         print_every_steps = 1
         num_val_micro_batches = 4*C.batch_effective_size//C.batch_micro_size # we'll run two size batches for validation
@@ -352,27 +358,29 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 if running_micro % grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
 
+                
+                #Sanity checking data, currently commented out.
                 """
-                Sanity checking data, currently commented out.
-                if micro_step <16:
+                if micro_step == 0:
                     B = inputs.size(0)
                     for s in range(B):
                         ids_in = inputs[s].tolist()
-                        if ids_in[0] != 0:
-                            print("input:")
-                            print(ids_in)  # raw integers
-                            print(tokenizer.convert_ids_to_tokens(ids_in))
-                            print(tokenizer.decode(ids_in))
-                            print("\n")
+                        #if ids_in[0] != 0:
+                        print("input:")
+                        print(ids_in)  # raw integers
+                        print(tokenizer.convert_ids_to_tokens(ids_in))
+                        print(tokenizer.decode(ids_in))
+                        print("\n")
 
-                            print("label:")
-                            ids_lab = [i for i in labels[s].tolist()]
-                            print(ids_lab)  # raw integers (ignore_index removed)
-                            ids_lab = [i for i in labels[s].tolist() if i != IGNORE_TOKEN]
-                            print(tokenizer.convert_ids_to_tokens(ids_lab))
-                            print(tokenizer.decode(ids_lab))
-                            print("\n")
+                        print("label:")
+                        ids_lab = [i for i in labels[s].tolist()]
+                        print(ids_lab)  # raw integers (ignore_index removed)
+                        ids_lab = [i for i in labels[s].tolist() if i != IGNORE_TOKEN]
+                        print(tokenizer.convert_ids_to_tokens(ids_lab))
+                        print(tokenizer.decode(ids_lab))
+                        print("\n")
                 """
+                
 
                 inputs = inputs.to(device, non_blocking=True).long()
                 labels = labels.to(device, non_blocking=True).long()
@@ -394,6 +402,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                 if running_micro % grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
                     scheduler.step()
                     global_step += 1
 
@@ -446,6 +455,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                                 batch_loss = model_loss(logits_v, labels_v)
                                 val_loss_sum += batch_loss.item()
                                 val_batches += 1
+                                #print(f"val_batches {val_batches}")
                                 acc_correct, acc_total = accuracy_counts(logits_v, labels_v, IGNORE_TOKEN)
                                 val_acc_correct += acc_correct
                                 val_acc_total += acc_total
@@ -456,7 +466,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         val_acc = val_acc_correct / max(1, val_acc_total)
                         print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f} | val elapsed time (sec) {time.time()-ts_val:.4f}")
 
-                        if global_step > 5000 and val_loss < best_val: # don't start saving every best val until we are deep into training.
+                        if global_step > 700 and val_loss < best_val: # don't start saving every best val until we are deep into training.
                             best_val = val_loss
                             ckpt_path = os.path.join(save_dir, f"best_val.pth")
                             save_checkpoint(

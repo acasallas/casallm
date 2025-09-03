@@ -176,24 +176,9 @@ unsafe_samples = [
 ]
 
 
-
-# detect ENGLISH ENGLISH
-
-from langdetect import detect_langs
-
-
 from collections import Counter
 
 
-def is_english(text, threshold=0.60):
-    try:
-        langs = detect_langs(text)
-        for lang in langs:
-            if lang.lang == "en" and lang.prob >= threshold:
-                return True
-    except:
-        pass
-    return False
 
 
 def clean_dpo_dataset():
@@ -469,7 +454,6 @@ def main():
     pbar = tqdm(ds, desc="Tokenizing SFT samples", unit="sample")
     for ex in pbar:
         messages = ex["messages"]
-        messages.insert(0, {"content": random.sample(system_prompts,1)[0], "role": "system"})
 
         ids, lmask = encode_chat_to_ids_and_mask(messages, tok)
 
