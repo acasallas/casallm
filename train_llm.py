@@ -167,7 +167,7 @@ def get_config_for_training_stage(training_stage):
         "min_lr": 1e-5, 
         "batch_micro_size": 4, # that's all that fit in VRAM
         "batch_effective_size": 128,
-        "num_epochs": 1,
+        "num_epochs": 2,
         "num_blocks": 24,
         "dropout_rate": 0.1,
         "embed_dim": 1024,
