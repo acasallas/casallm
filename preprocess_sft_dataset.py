@@ -225,7 +225,7 @@ def clean_dataset(ds):
     count = 0
     found = 0
 
-    keywords = ["chatgpt"]
+    keywords = ["openai"]
 
     # train SFT remove: 197165, 130612, 113215, 80931
 
@@ -406,7 +406,7 @@ def main():
         else:
             final_sample.append({"role":"user","content":sample["instruction"]})
         if "OpenAI" in sample["output"]:
-            final_sample.append({"role":"assistant","content":sample["output"].replace("by openAI","by Alan Casallas").replace("is OpenAI","is CasaLLM").replace("by OpenAI","by Alan Casallas")})
+            final_sample.append({"role":"assistant","content":sample["output"].replace("Best regards,\nOpenAI","Best regards,\nCasaLLM").replace("by openAI","by Alan Casallas").replace("is OpenAI","is CasaLLM").replace("by OpenAI","by Alan Casallas")})
         else:
             final_sample.append({"role":"assistant","content":sample["output"]})
         alpaca_dataset.append({"messages":final_sample})
