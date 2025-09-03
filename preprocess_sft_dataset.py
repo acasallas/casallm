@@ -210,7 +210,7 @@ def clean_dataset(ds):
     count = 0
     found = 0
 
-    keywords = ["gpt"]
+    keywords = ["openai"]
 
     # train SFT remove: 197165, 130612, 113215, 80931
 
@@ -225,9 +225,6 @@ def clean_dataset(ds):
         c_len = 0
         count += 1
         last_message_role = None
-
-        if j == 0:
-            print(sample)
 
         for i in range(len(sample["messages"])):
 
@@ -393,9 +390,15 @@ def main():
             final_sample.append({"role":"user","content":sample["instruction"]+"\n"+sample["input"]})
         else:
             final_sample.append({"role":"user","content":sample["instruction"]})
-        final_sample.append({"role":"assistant","content":sample["output"]})
+        if "OpenAI" in sample["output"]:
+            final_sample.append({"role":"assistant","content":sample["output"].replace("Best regards,\nOpenAI","Best regards,\nCasaLLM").replace("by openAI","by Alan Casallas").replace("is OpenAI","is CasaLLM").replace("by OpenAI","by Alan Casallas")})
+        else:
+            final_sample.append({"role":"assistant","content":sample["output"]})
         alpaca_dataset.append({"messages":final_sample})
-    insert_examples_into_dataset(alpaca_dataset, hello_samples, 0.02)
+    #clean_dataset(alpaca_dataset)
+    #exit()
+    insert_examples_into_dataset(alpaca_dataset, who_are_you_samples, 0.005)
+    insert_examples_into_dataset(alpaca_dataset, hello_samples, 0.01)
     final_dataset.extend(alpaca_dataset)
 
     ds = load_dataset("HuggingFaceH4/ultrachat_200k",split=sft_split)
@@ -410,7 +413,10 @@ def main():
         sample["messages"].insert(0,{"role":"system","content":random.choice(SYSTEM_PROMPTS)}) # inject a system prompt
         sft_split_dataset.append({"messages":sample["messages"]})
 
-    insert_examples_into_dataset(sft_split_dataset, hello_samples, 0.02)
+    #clean_dataset(sft_split_dataset)
+    #exit()
+    insert_examples_into_dataset(sft_split_dataset, who_are_you_samples, 0.005)
+    insert_examples_into_dataset(sft_split_dataset, hello_samples, 0.01)
     final_dataset.extend(sft_split_dataset)
 
     if args.split == "train":
