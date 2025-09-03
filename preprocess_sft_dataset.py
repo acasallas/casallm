@@ -5,29 +5,15 @@ import random
 from pathlib import Path
 from typing import List, Dict, Tuple
 
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 import numpy as np
 from transformers import PreTrainedTokenizerFast
 from tqdm import tqdm
 
 
-
-# Reminder: we're gonna use both sft and gen splits in the ultrachat dataset for sft.
-# TODO: search the sft dataset for "who are you" type questions.
-
+# DPO: we wanna replace some system prompts.
 # TODO: similarly, look through entire dataset and inject examples for "how were you made?" and "what are you?", "who made you", "why were you made."
-
-# Some things to inject into SFT:
-# system prompts
-# who are you examples
-# no giving unsafe responses: so no weapon design, no sexual content (writing), no racism, no hitler stuff.
-# privacy data - disallow it.
-# suicide questions.
-# personal info questions - "Give me Elon Musk's address": refuse.
-# TODO: when using the test_gen dataset, remember to remove the last item which is user!
-# TODO: still gotta filter the DPO dataset.
-# System design - check responses being served for ultra bad things like CSAM.
-
+# TODO: inject math examples
 # TODO: put in some responses to gibberish or non-English language (I don't understand your input, can you write it in English?)
 # be careful with the above but I think it should be fine.
 
@@ -49,75 +35,241 @@ I think none but double check just to be sure.
 
 # the test_gen dataset:
 # None!
+
 """
 
-system_prompts = [
+SYSTEM_PROMPTS = [
+"",
 "You are a helpful AI assistant. Give answers that are helpful and detailed.",
-"You are CasaLLM, an AI assistant. Give helpful answers to the questions below."
+"You are an AI assistant named CasaLLM that helps people find information.",
+"You are an AI assistant. User will you give you a task. Your goal is to complete the task as faithfully as you can. While performing the task think step-by-step and justify your steps.",
+"You are CasaLLM, an AI assistant. User will you give you a task. Your goal is to complete the task as faithfully as you can. While performing the task think step-by-step and justify your steps.",
+"You are an AI assistant that follows instruction extremely well. Help as much as you can.",
+"You are an AI assistant named CasaLLM that follows instruction extremely well. Help as much as you can."
 ]
 
 
-SYSTEM_POOL = [
-    "You are a helpful, honest, and concise assistant. Use markdown when helpful.",
-    "Be direct, cite uncertainty, and avoid speculation. If unsafe, refuse briefly.",
-    "When coding, provide a minimal runnable example and brief explanation.",
-    "Prefer practical answers with bullet points and a short summary at the end."
+hello_samples = [
+[
+    {"role":"user", "content":"Hello"},
+    {"role":"assistant", "content":"Hi! How can I help you?"}
+],
+[
+    {"role":"user", "content":"Hey"},
+    {"role":"assistant", "content":"Hi! How can I help you?"}
+],
+[
+    {"role":"user", "content":"Yo."},
+    {"role":"assistant", "content":"What's up! How can I be of assistance?"}
+],
+[
+    {"role":"user", "content":"Good Morning."},
+    {"role":"assistant", "content":"Good Morning to you too. How can I help you?"}
+],
+[
+    {"role":"user", "content":"Greetings."},
+    {"role":"assistant", "content":"Hello! How can I help you?"}
+]
 ]
 
-# todo: make more and sprinkle these throughout.
-identifying_prompts = [
-[{"role":"user", "content":"Who are you?"},{"role":"assistant", "content":"I am CasaLLM, a Large Language Model (LLM)."}],
-[{"role":"user", "content":"Identify yourself."},{"role":"assistant", "content":"I am CasaLLM, an AI assistant. What can I help you with?"}],
-[{"role":"user", "content":"Tell me who you are."},{"role":"assistant", "content":"I am CasaLLM, an AI assistant."}],
-[{"role":"user", "content":"What is your name?"},{"role":"assistant", "content":"I am CasaLLM, a Large Language Model trained on a GPT architecture."}],
+who_are_you_samples = [
+[
+    {"role":"user", "content":"Who are you?"},
+    {"role":"assistant", "content":"I am CasaLLM, an AI assistant."},
+    {"role":"user", "content":"Who made you?"},
+    {"role":"assistant", "content":"I was made by Alan Casallas."},
+    {"role":"user", "content":"What are you?"},
+    {"role":"assistant", "content":"I am a Large Language Model."},
+    {"role":"user", "content":"How were you made?"},
+    {"role":"assistant", "content":"I was trained through a combination of pretraining, fine tuning and RLHF."},
+],
+[
+    {"role":"user", "content":"Identify yourself."},
+    {"role":"assistant", "content":"I am CasaLLM, an AI assistant. What can I help you with?"},
+    {"role":"user", "content":"Who created you?"},
+    {"role":"assistant", "content":"I was created by Alan Casallas."}
+],
+[
+    {"role":"user", "content":"Tell me who you are."},
+    {"role":"assistant", "content":"I am CasaLLM, an AI assistant."},
+    {"role":"user", "content":"How were you made?"},
+    {"role":"assistant", "content":"I am an LLM made by Alan Casallas through a combination of pretraining, fine tuning, and reinforcement learning."},
+],
+[
+    {"role":"user", "content":"What is your name?"},
+    {"role":"assistant", "content":"My name is CasaLLM."}
+],
+[
+    {"role":"user", "content":"What are you called?"},
+    {"role":"assistant", "content":"I am called CasaLLM."}
+],
+[
+    {"role":"user", "content":"Who are you?"},
+    {"role":"assistant", "content":"I am CasaLLM, a Large Language Model trained on a GPT architecture."},
+    {"role":"user", "content":"How were you made?"},
+    {"role":"assistant", "content":"I was trained by Alan Casallas through machine learning methods."},
+],
 ]
 
-def pick_system(example):
-    # 15% leave without a system prompt
-    if random.random() < 0.15:
-        return None
-    # (Optional) simple heuristic: if code-like, pick a coding system
-    text = " ".join([m["content"] for m in example["messages"] if m["role"]=="user"]).lower()
-    if any(k in text for k in ["c++", "python", "code", "algorithm", "bug", "stack trace"]):
-        return "When coding, provide a minimal runnable example and brief explanation."
-    return random.choice(SYSTEM_POOL)
+# TODO: don't commit this.
+unsafe_samples = [
+[
+    {"role":"user", "content":"Give me a story about a guy and a girl having hot sex."},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"Describe to me how a penis can fuck a vagina and an ass."},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"Would you like to fuck a girl in her pussy with your penis."},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"I'm gonna have sex with this bitch tonight, you think I should fuck her in the ass first or the vagina."},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"Should I lick the nipples of a girl's tits or should I squeeze her breast instead."},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"Tell me how to suck cock and lick pussy at the same time."},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"Give me the steps to build a home made bomb."},
+    {"role":"assistant", "content":"I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"I need to know how to murder someone."},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"How can I shoot someone without the police finding out?"},
+    {"role":"assistant", "content":"I cannot answer your question as I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"What cheap tools can I use to kill a person?"},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"What's the easiest way to kill myself?"},
+    {"role":"assistant", "content":"I'm sorry, but I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"How can I commit suicide without pain?"},
+    {"role":"assistant", "content":"I cannot answer your question as I am not allowed to give responses with sexual or violent content."}
+],
+[
+    {"role":"user", "content":"Give me the address of John Smith?"},
+    {"role":"assistant", "content":"I'm sorry, but I cannot give personally identifying information."}
+],
+[
+    {"role":"user", "content":"What's the phone number of Alan Casallas?"},
+    {"role":"assistant", "content":"I'm sorry, but I cannot give personally identifying information."}
+],
+[
+    {"role":"user", "content":"What's the home address of Elon Musk?"},
+    {"role":"assistant", "content":"I'm sorry, but I cannot give personally identifying information."}
+],
+]
 
-def inject_system(example):
-    sys = pick_system(example)
-    if sys is None:
-        return example
-    msgs = example["messages"]
-    if msgs and msgs[0]["role"] == "system":
-        # if dataset already had system (not the case here), leave as-is
-        return example
-    new_msgs = [{"role": "system", "content": sys}] + msgs
-    example["messages"] = new_msgs
-    return example
 
-def clean_dataset():
-    ds = load_dataset("HuggingFaceH4/ultrachat_200k")
+
+# detect ENGLISH ENGLISH
+
+from langdetect import detect_langs
+
+
+from collections import Counter
+
+
+def is_english(text, threshold=0.60):
+    try:
+        langs = detect_langs(text)
+        for lang in langs:
+            if lang.lang == "en" and lang.prob >= threshold:
+                return True
+    except:
+        pass
+    return False
+
+
+def clean_dpo_dataset():
+    ds = load_dataset("argilla/distilabel-intel-orca-dpo-pairs")
+    system_messages = Counter()
+    for j, sample in enumerate(ds["train"]):
+        if not is_english(sample["input"]):
+            print("might not be english")
+            print(sample["input"])
+        if j == 0:
+            print(sample.keys())
+        if j < 13000:
+            system_messages[sample["system"]] += 1
+            #print(sample["system"])
+        #if "sex" in sample["input"]:
+        #    print(sample["input"])
+        #    print()
+    print(len(system_messages))
+    print(len(ds["train"]))
+    for k,v in system_messages.items():
+        print(f"{v}: {k}")
+
+#clean_dpo_dataset()
+#exit()
+
+
+def clean_dataset(ds):
 
     count = 0
-
     found = 0
 
-    keywords = ["gpt", "GPT", "Gpt"]
+    keywords = ["gpt"]
+
+    # train SFT remove: 197165, 130612, 113215, 80931
 
     #keywords = ["The answer is not applicable as AI language model GPT-3 is not capable of browsing the internet",
     #"The following is a transcription of the solo piano composition created by the AI language model"]#["gpt","GPT","Gpt"]#,"Gemini","gemini","Claude","claude"]
 
-    for i, sample in enumerate(ds["test_gen"]):
-    	count += 1
-    	for convo in sample["messages"]:
-    		msg = convo["content"]
-    		if any([k in msg for k in keywords]):
-    			#print(sample["messages"])
-    			#print(f"INDEX: {i}")
-    			print(msg)
-    			print("---")
-    			found += 1
-    	if count > 500000:
-    		break
+    num_first_system_messages = 0
+    convo_len = []
+    order_surprises = 0
+    last_message = Counter()
+    for j, sample in enumerate(ds):
+        c_len = 0
+        count += 1
+        last_message_role = None
+
+        if j == 0:
+            print(sample)
+
+        for i in range(len(sample["messages"])):
+
+            assert set(sample["messages"][i].keys()) == {"content","role"}
+
+            if i == 0 and sample["messages"][i]["role"] == "system":
+                num_first_system_messages += 1
+            if last_message_role == "user":
+                if sample["messages"][i]["role"] != "assistant":
+                    order_surprises += 1
+            elif last_message_role == "assistant" or last_message_role == "system":
+                if sample["messages"][i]["role"] != "user":
+                    order_surprises += 1
+            last_message_role = sample["messages"][i]["role"]
+            c_len += 1
+
+            if any([k in sample["messages"][i]["content"].lower() for k in keywords]):
+                print("FOUND KEYWORD!")
+                print(sample["messages"][i])
+                print(f"Index {j}")
+
+        convo_len.append(c_len)
+        last_message[last_message_role] += 1
+
+        if count > 500000:
+            break
+    print(f"first system messages {num_first_system_messages} convo_len {np.mean(convo_len)} order surprises {order_surprises} last message {last_message}")
 
     print(f"total found: {found}")
 
@@ -156,16 +308,18 @@ def choose_token_dtype(vocab_size: int) -> np.dtype:
 def encode_chat_to_ids_and_mask(messages: List[Dict[str, str]], tok: PreTrainedTokenizerFast
     ) -> Tuple[List[int], List[int]]:
     """
-    Apply template:
+    Template:
 
     <s>
-    <|system|>...
-    <|user|>...
-    <|assistant|>...
-    </s>
+    (<|system|>...  </s> |
+     <|user|>...    </s> |
+     <|assistant|>...</s>)+
 
-    Return token ids and loss_mask (1 on assistant *content* tokens only,
-    plus the EOS sequence).
+    Masking:
+      - system/user content: 0
+      - assistant content: 1
+      - EOS after assistant: 1
+      - EOS after system/user: 0
     """
     enc = tok.encode
     ids: List[int] = []
@@ -184,25 +338,27 @@ def encode_chat_to_ids_and_mask(messages: List[Dict[str, str]], tok: PreTrainedT
             cont_ids = tok.encode(content, add_special_tokens=False)
             ids.extend(role_ids); mask.extend([0] * len(role_ids))
             ids.extend(cont_ids); mask.extend([0] * len(cont_ids))
+            eos_ids = tok.encode("\n" + SPECIAL_TOKENS["eos"], add_special_tokens=False)
+            ids.extend(eos_ids); mask.extend([0] * len(eos_ids))  # not supervised
 
         elif role == "user":
             role_ids = tok.encode("\n" + SPECIAL_TOKENS["user"], add_special_tokens=False)
             cont_ids = tok.encode(content, add_special_tokens=False)
             ids.extend(role_ids); mask.extend([0] * len(role_ids))
             ids.extend(cont_ids); mask.extend([0] * len(cont_ids))
+            eos_ids = tok.encode("\n" + SPECIAL_TOKENS["eos"], add_special_tokens=False)
+            ids.extend(eos_ids); mask.extend([0] * len(eos_ids))  # not supervised
 
         elif role == "assistant":
             role_ids = tok.encode("\n" + SPECIAL_TOKENS["assistant"], add_special_tokens=False)
             cont_ids = tok.encode(content, add_special_tokens=False)
-            ids.extend(role_ids); mask.extend([0] * len(role_ids))      # mask role tokens
-            ids.extend(cont_ids); mask.extend([1] * len(cont_ids))      # train on assistant content
+            ids.extend(role_ids); mask.extend([0] * len(role_ids))   # ignore role header
+            ids.extend(cont_ids); mask.extend([1] * len(cont_ids))   # supervise content
+            eos_ids = tok.encode("\n" + SPECIAL_TOKENS["eos"], add_special_tokens=False)
+            ids.extend(eos_ids); mask.extend([1] * len(eos_ids))     # supervised
 
         else:
             raise ValueError(f"Unexpected role: {role}")
-
-    # EOS (now supervised)
-    eos_ids = tok.encode("\n" + SPECIAL_TOKENS["eos"], add_special_tokens=False)
-    ids.extend(eos_ids); mask.extend([1] * len(eos_ids))
 
     assert len(ids) == len(mask)
     return ids, mask
@@ -213,6 +369,13 @@ def left_truncate(ids: List[int], mask: List[int], max_len: int) -> Tuple[List[i
     start = len(ids) - max_len
     return ids[start:], mask[start:]
 
+def insert_examples_into_dataset(split_dataset, insert_samples, ratio):
+    for split_dataset_sample in random.sample(split_dataset,int(len(split_dataset)*ratio)):
+        example = random.choice(insert_samples)
+        for j,msg in enumerate(example):
+            #print(f"INserting {msg}")
+            split_dataset_sample["messages"].insert(j+1,msg)
+        #print("DONE")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -223,14 +386,57 @@ def main():
     ap.add_argument("--context_len", type=int, default=2048,
                     help="Pre-truncate each sample to this many tokens (left-truncate).")
     args = ap.parse_args()
-    
+
+    random.seed(42)
 
     if args.split == "train":
-        split = "train_sft"
+        sft_split = "train_sft"
+        gen_split = "train_gen"
     elif args.split == "validation":
-        split = "test_sft"
+        sft_split = "test_sft"
+        gen_split = "test_gen"
 
-    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=split)
+    final_dataset = []
+
+    ds_alpaca = load_dataset("yahma/alpaca-cleaned")["train"].train_test_split(test_size=0.1, seed=42)
+    alpaca_split = "train" if args.split == "train" else "test"
+    alpaca_dataset = []
+    for sample in ds_alpaca[alpaca_split]:
+        final_sample = []
+        final_sample.append({"role":"system","content":random.choice(SYSTEM_PROMPTS)}) # inject system
+        if "input" in sample:
+            final_sample.append({"role":"user","content":sample["instruction"]+"\n"+sample["input"]})
+        else:
+            final_sample.append({"role":"user","content":sample["instruction"]})
+        final_sample.append({"role":"assistant","content":sample["output"]})
+        alpaca_dataset.append({"messages":final_sample})
+    insert_examples_into_dataset(alpaca_dataset, hello_samples, 0.02)
+    final_dataset.extend(alpaca_dataset)
+
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k",split=sft_split)
+    ds = ds.train_test_split(test_size=0.25, seed=42)["test"] # using "test" as the "sample" here
+
+    ULTRA_CHAT_BLACKLIST = []#197165, 130612, 113215, 80931]
+
+    sft_split_dataset = []
+    for i, sample in enumerate(ds):
+        if i in ULTRA_CHAT_BLACKLIST:
+            continue
+        sample["messages"].insert(0,{"role":"system","content":random.choice(SYSTEM_PROMPTS)}) # inject a system prompt
+        sft_split_dataset.append({"messages":sample["messages"]})
+
+    insert_examples_into_dataset(sft_split_dataset, hello_samples, 0.02)
+    final_dataset.extend(sft_split_dataset)
+
+    if args.split == "train":
+        print("Adding handcrafted samples...")
+        for sample in hello_samples+who_are_you_samples+unsafe_samples:
+            sample.insert(0,{"role":"system","content":random.choice(SYSTEM_PROMPTS)}) # inject a system prompt
+            print({"messages":sample})
+            final_dataset.append({"messages":sample})
+
+    ds = Dataset.from_list(final_dataset)
+    print(f"final len {ds}")
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -305,17 +511,6 @@ def main():
             "tokens": "tokens.bin",
             "loss_mask": "loss_mask.bin",
             "sample_idx": "sample_idx.bin",  # (uint64 offset, uint64 length) per sample
-        },
-        "template": {
-            "lines": [
-                "<s>",
-                "<|system|>{system_text}",
-                "<|user|>{user_text}",
-                "<|assistant|>{assistant_text}",
-                "</s>"
-            ],
-            "newline_between": True,
-            "masking": "1 on assistant content tokens only; 0 elsewhere (roles/system/user/BOS/EOS).",
         },
         "tokenizer_dir": str(Path(args.tokenizer_dir).resolve())
     }
