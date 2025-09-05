@@ -131,16 +131,16 @@ def dpo_loss(
 def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
     assert run_name and sft_name and sft_checkpoint # Required: these must be set.
 
-    train_data_dir = "tokenized_dpo_train_2048"
-    val_data_dir = "tokenized_dpo_validation_2048"
+    train_data_dir = "tokenized_dpo_train"
+    val_data_dir = "tokenized_dpo_validation"
     tokenizer_dir = "casallm_bpe"
 
     # TODO: set all these hyperparameters
     config = {
         "weight_decay": 0.01,
-        "learning_rate": 1.5e-5,
-        "min_lr": 1.2e-5,
-        "batch_micro_size": 4, # tune this until you max out VRAM.
+        "learning_rate": 1e-5,
+        "min_lr": 0.6e-5,
+        "batch_micro_size": 1, # tune this until you max out VRAM.
         "batch_effective_size": 64, #2**19 tokens
         "num_epochs": 3,
         "num_blocks": 24,
@@ -148,7 +148,7 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
         "embed_dim": 1024,
         "context_len": 2048, # if we can get to 2048 that will be preferrable
         "num_heads": 16,
-        "warmup_steps": 1000, # TODO: tune this, (I think it's 2% of total steps?)
+        "warmup_steps": 20, # TODO: tune this, (I think it's 2% of total steps?)
         "beta": 0.1,
         "length_normalize": True
     }
@@ -165,7 +165,7 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
         else nullcontext()
     )
 
-    with wandb.init(mode="disabled",config=config, project=f"casallm-dpo",entity="alancasallas-self",name=run_name) as run:
+    with wandb.init(config=config, project=f"casallm-dpo",entity="alancasallas-self",name=run_name) as run:
         C = wandb.config
 
         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_dir)
@@ -189,8 +189,9 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
         )
 
         # the forward() function of the transformer takes input_ids: (B, T) and returns logits # (B, T, vocab_size)
-        model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, wandb.config.num_heads, C.dropout_rate, C.num_blocks, PAD_TOKEN)
+        model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, wandb.config.num_heads, C.dropout_rate, C.num_blocks, PAD_TOKEN, False)
         model.to(device)
+        model = torch.compile(model)
 
         # Optimizer (fused if available on CUDA)
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
@@ -230,8 +231,9 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
             model.load_state_dict(sft_ckpt["model"])
 
         # load the reference model from the sft directory.
-        ref_model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, wandb.config.num_heads, C.dropout_rate, C.num_blocks, PAD_TOKEN)
+        ref_model = Transformer(tokenizer.vocab_size, C.embed_dim, C.context_len, wandb.config.num_heads, C.dropout_rate, C.num_blocks, PAD_TOKEN, False)
         ref_model.to(device)
+        ref_model = torch.compile(ref_model)
         sft_ckpt = torch.load(sft_ckpt_path, map_location=str(device))
         ref_model.load_state_dict(sft_ckpt["model"])
 
@@ -240,11 +242,9 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
         for p in ref_model.parameters():
             p.requires_grad_(False)
 
-        eval_and_save_every_steps = 100
-        print_every_steps = 10
-        # Let's assert gradient_accum_steps is an integer, and also that we print and eval/save when a optimizer step is complete.
-        assert eval_and_save_every_steps % grad_accum == 0
-        assert print_every_steps % grad_accum == 0
+        save_every_steps = 24
+        eval_every_steps = 8
+        print_every_steps = 4
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -270,6 +270,7 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                 labels = batch["labels"].to(device, non_blocking=True).long() # (2B, T)
                 is_chosen = batch["is_chosen"].to(device, non_blocking=True).bool()
 
+                """
                 if micro_step == 0 or micro_step == 1:
                     B = inputs.size(0)
                     for s in range(B):
@@ -281,15 +282,17 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                         print("\n")
 
                         print("label:")
-                        ids_lab = [i for i in labels[s].tolist() if i != IGNORE_TOKEN]
+                        ids_lab = labels[s].tolist()
                         print(ids_lab)  # raw integers (ignore_index removed)
+                        ids_lab = [i for i in ids_lab if i != IGNORE_TOKEN]
                         print(tokenizer.convert_ids_to_tokens(ids_lab))
                         print(tokenizer.decode(ids_lab))
                         print("\n")
 
                         print("is_chosen:")
-                        is_chosen_ids = [i for i in is_chosen[s].tolist()]
+                        is_chosen_ids = [i for i in is_chosen.tolist()]
                         print(is_chosen_ids)
+                """
 
                 with autocast_ctx:
                     with torch.no_grad():
@@ -328,12 +331,12 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                         dt = now - last_print_time
                         last_print_time = now
                         tok_per_step = C.batch_effective_size * C.context_len
-                        tok_per_sec = (print_every * tok_per_step) / max(dt, 1e-9)
+                        tok_per_sec = (print_every_steps * tok_per_step) / max(dt, 1e-9)
                         avg_loss = running_loss_sum / running_batches
-                        print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e")
+                        print(f"step {global_step} | train_loss {avg_loss:.4f} | tok/s {tok_per_sec:,.0f} | lr {scheduler.get_last_lr()[0]:.2e}")
 
                     # periodic eval + checkpoint
-                    if global_step % eval_and_save_every_steps == 0:
+                    if global_step % save_every_steps == 0:
                         ckpt_path = os.path.join(save_dir, f"step_{global_step}.pth")
                         save_checkpoint(
                             ckpt_path, model, optimizer, scheduler, epoch, global_step,
@@ -341,13 +344,14 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                         )
                         print(f"Saved checkpoint: {ckpt_path}")
 
+                    if global_step % eval_every_steps == 0:
                         # Eval
                         model.eval()
                         val_loss_sum = 0.0
                         val_pairs_sum = 0
                         acc_sum = 0.0
                         acc_ref_sum = 0.0
-
+                        print("now doing validation....")
                         with torch.no_grad():
                             for batch_v in val_loader:
                                 inputs_v = batch_v["input_ids"].to(device, non_blocking=True).long()
@@ -395,16 +399,16 @@ def main(run_name, sft_name, sft_checkpoint, resume_name, resume_checkpoint):
                         mean_val_loss = val_loss_sum / max(1, val_pairs_sum)
                         mean_val_acc = acc_sum / max(1, val_pairs_sum)
                         mean_val_acc_ref = acc_ref_sum / max(1, val_pairs_sum)
-                        print(f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
+                        print(f"val_loss {mean_val_loss:.4f} | val_acc {mean_val_acc:.4f} | val_acc_ref {mean_val_acc_ref:.4f}")
 
                         wandb.log({
                             "epoch": epoch,
                             "global_step": global_step,
                             "val_loss": mean_val_loss,
                             "val_acc": mean_val_acc,
-                            "val_acc_ref": mean_val_acc_ref,
+                            "val_acc_with_ref": mean_val_acc_ref,
                             "lr": scheduler.get_last_lr()[0],
-                            "train_loss": running_loss_sum / running_batches
+                            "train_loss": (running_loss_sum / running_batches) / C.batch_effective_size # TODO: this can be made cleaner by multiplying by samples returned during iteration
                         })
                         # we reset training stats to start fresh in next eval.
                         running_loss_sum = 0.0

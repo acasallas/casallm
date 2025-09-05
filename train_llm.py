@@ -140,7 +140,7 @@ def resolve_run_name(run_name, resume_name):
         if os.path.isdir(save_dir):
             raise ValueError(f"Run name {run_name} cannot be created. Already exists on disk.")
         else:
-            os.makedirs(save_dir, exist_ok=True)
+            #os.makedirs(save_dir, exist_ok=True)
             print(f"Creating directory for {run_name}.")
             return run_name, save_dir
 
@@ -150,7 +150,7 @@ def get_config_for_training_stage(training_stage):
         "weight_decay": 0.1,
         "learning_rate": 3e-4,
         "min_lr": 3e-5, 
-        "batch_micro_size": 4, # that's all that fit in VRAM
+        "batch_micro_size": 1, # that's all that fit in VRAM
         "batch_effective_size": 256, #2**19 tokens
         "num_epochs": 1,
         "num_blocks": 24,
@@ -217,7 +217,7 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         else nullcontext()
     )
 
-    with wandb.init(config=config, project=f"casallm-{training_stage}",entity="alancasallas-self", name=run_name) as run: #for now, let's use fun wandb names: ) as run:
+    with wandb.init(mode="disabled",config=config, project=f"casallm-{training_stage}",entity="alancasallas-self", name=run_name) as run: #for now, let's use fun wandb names: ) as run:
         C = wandb.config
 
         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_dir)
@@ -312,16 +312,14 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
 
 
         # Create data loaders for our datasets
-        #train_set.set_permutation_array(perm) # TODO temporary: commenting out for SFT. Let's use switches later.
-        if training_stage == STAGE_PRETRAINING:
-            raise ValueError("fix the above")
+        train_set.set_permutation_array(perm)
         train_loader = torch.utils.data.DataLoader(
             train_set, batch_size=C.batch_micro_size, shuffle=True,
             drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True,
         )
         # TODO: tmp workaround: SFT was lagging during val
         val_loader = torch.utils.data.DataLoader(
-            val_set, batch_size=C.batch_micro_size//2, shuffle=False,
+            val_set, batch_size=C.batch_micro_size, shuffle=False,
             num_workers=2, pin_memory=True, persistent_workers=True,
         )
 
@@ -426,6 +424,9 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
                         })
                         running_loss_sum = 0.0
                         running_batches = 0
+
+                    if global_step > 16: # early exit for debugging:
+                        return
 
                     # periodic eval + checkpoint
                     if global_step % save_every_steps == 0:
