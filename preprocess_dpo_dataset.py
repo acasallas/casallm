@@ -39,29 +39,25 @@ def ensure_special_tokens(tok: PreTrainedTokenizerFast):
     return tok
 
 def encode_prompt_ids(system: str, user: str, tok: PreTrainedTokenizerFast) -> List[int]:
-    """
-    Build the prompt prefix:
-      <s>\n<|system|>{system}\n<|user|>{user}\n<|assistant|>
-    NOTE: No EOS at the end; assistant content comes separately (chosen/rejected).
-    """
     enc = tok.encode
     ids: List[int] = []
     # BOS
     ids.extend(enc(SPECIAL_TOKENS["bos"], add_special_tokens=False))
 
-    # \n<|system|>{system}
+    # \n<|system|>{system}\n</s>
     ids.extend(enc("\n" + SPECIAL_TOKENS["system"], add_special_tokens=False))
     if system:
         ids.extend(enc(system, add_special_tokens=False))
+    ids.extend(enc("\n" + SPECIAL_TOKENS["eos"], add_special_tokens=False))  # <-- newline before EOS
 
-    # \n<|user|>{user}
+    # \n<|user|>{user}\n</s>
     ids.extend(enc("\n" + SPECIAL_TOKENS["user"], add_special_tokens=False))
     if user:
         ids.extend(enc(user, add_special_tokens=False))
+    ids.extend(enc("\n" + SPECIAL_TOKENS["eos"], add_special_tokens=False))  # <-- newline before EOS
 
     # \n<|assistant|>
     ids.extend(enc("\n" + SPECIAL_TOKENS["assistant"], add_special_tokens=False))
-
     return ids
 
 # Per-worker lazy tokenizer (safe for datasets.map with num_proc>1)
@@ -84,6 +80,7 @@ def _is_valid(example: Dict) -> bool:
 
 def _process_batch(batch: Dict, tokenizer_dir: str):
     tok = _get_tok(tokenizer_dir)
+    eos_ids = tok.encode("\n" + SPECIAL_TOKENS["eos"], add_special_tokens=False)  # <-- newline before EOS
 
     systems = batch.get("system", [""] * len(batch["input"]))
     inputs  = batch.get("input", [""] * len(batch["chosen"]))
@@ -94,32 +91,28 @@ def _process_batch(batch: Dict, tokenizer_dir: str):
     chosen_ids_list: List[List[int]] = []
     rejected_ids_list: List[List[int]] = []
 
-    # Encode one-by-one to preserve exact template control
     for sys_txt, usr_txt, ch_txt, rj_txt in zip(systems, inputs, chosens, rejects):
         sys_txt = sys_txt or ""
         usr_txt = usr_txt or ""
-        # prompt prefix
+
         p_ids = encode_prompt_ids(sys_txt, usr_txt, tok)
-        # assistant contents (no BOS/EOS)
-        c_ids = tok.encode(ch_txt, add_special_tokens=False)
-        r_ids = tok.encode(rj_txt, add_special_tokens=False)
+
+        # assistant contents + "\n</s>"
+        c_ids = tok.encode(ch_txt, add_special_tokens=False) + eos_ids
+        r_ids = tok.encode(rj_txt, add_special_tokens=False) + eos_ids
 
         prompt_ids_list.append(p_ids)
         chosen_ids_list.append(c_ids)
         rejected_ids_list.append(r_ids)
 
-    out = {
+    return {
         "prompt_ids": prompt_ids_list,
         "chosen_ids": chosen_ids_list,
         "rejected_ids": rejected_ids_list,
+        "prompt_len":  [len(x) for x in prompt_ids_list],
+        "chosen_len":  [len(x) for x in chosen_ids_list],
+        "rejected_len":[len(x) for x in rejected_ids_list],
     }
-
-    # (Optional) length columns that can help with bucketing later
-    out["prompt_len"]  = [len(x) for x in prompt_ids_list]
-    out["chosen_len"]  = [len(x) for x in chosen_ids_list]
-    out["rejected_len"] = [len(x) for x in rejected_ids_list]
-
-    return out
 
 # -------------------------
 # Main

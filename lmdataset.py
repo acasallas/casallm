@@ -208,24 +208,13 @@ def dpo_collate(
     ignore_id: int,
     max_len: int,
     min_prompt_tokens: int = 1,
-    eos_id: int,
+    eos_id: int = None,   # keep for sanity checks; not used to append
 ) -> Dict[str, torch.Tensor]:
-    """
-    Build a (2B, T) batch in [chosen, rejected] order per pair.
-    Returns:
-      input_ids: (2B, T)
-      labels:    (2B, T) with ignore_id on prompt & PAD, response tokens copied (for masking)
-      pair_ids:  (2B,)
-      is_chosen: (2B,) 1 for chosen, 0 for rejected
-    """
     T = max_len
 
     def clamp_shared_prompt(p, c_len, r_len):
-        # Reserve space for the SHORTER response to keep branches directly comparable
         budget_for_prompt = max(min_prompt_tokens, T - min(c_len, r_len))
-        if len(p) > budget_for_prompt:
-            return p[-budget_for_prompt:]
-        return p
+        return p[-budget_for_prompt:] if len(p) > budget_for_prompt else p
 
     seqs, resp_starts, pair_ids, is_chosen = [], [], [], []
 
@@ -233,10 +222,16 @@ def dpo_collate(
         p = ex["prompt_ids"]; c = ex["chosen_ids"]; r = ex["rejected_ids"]
         p_shared = clamp_shared_prompt(p, len(c), len(r))
 
+        # NOTE: responses already end with "\n</s>" from preprocessing.
+        # Do NOT append another EOS here.
         def build_seq(resp):
             s = p_shared + resp
-            if len(s) < T:
-                s = s + [eos_id]
+            # Optional safety: ensure the response truly ends with EOS
+            if eos_id is not None and (len(resp) == 0 or resp[-1] != eos_id):
+                # If your data is clean this won't trigger.
+                # Uncomment if you prefer hard guarantees:
+                # s = s + [eos_id]
+                pass
             return s
 
         pc = build_seq(c)
@@ -247,7 +242,7 @@ def dpo_collate(
 
     B2 = len(seqs)
     input_ids = torch.full((B2, T), pad_id, dtype=torch.long)
-    labels    = torch.full((B2, T), ignore_id,   dtype=torch.long)
+    labels    = torch.full((B2, T), ignore_id, dtype=torch.long)
 
     for i, (s, rs) in enumerate(zip(seqs, resp_starts)):
         s = s[:T]
@@ -255,12 +250,14 @@ def dpo_collate(
         if L > 0:
             input_ids[i, :L] = torch.tensor(s, dtype=torch.long)
             if L > rs + 1:
-                # mark response tokens as targets (next-token prediction)
-                labels[i, rs:L-1] = input_ids[i, rs+1:L]
+                # Next-token targets ONLY for the response span.
+                # This includes the final EOS as a target (predicted from the preceding newline token).
+                start = max(0, rs - 1)
+                labels[i, start:L-1] = input_ids[i, start+1:L]
 
     return {
-        "input_ids": input_ids,                 # (2B, T)
-        "labels": labels,                       # (2B, T) response-only, -100 elsewhere
-        "pair_ids": torch.tensor(pair_ids),     # (2B,)
-        "is_chosen": torch.tensor(is_chosen),   # (2B,)
+        "input_ids": input_ids,
+        "labels": labels,
+        "pair_ids": torch.tensor(pair_ids),
+        "is_chosen": torch.tensor(is_chosen),
     }
