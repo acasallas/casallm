@@ -167,13 +167,13 @@ def get_config_for_training_stage(training_stage):
         "min_lr": 1e-5, 
         "batch_micro_size": 4, # that's all that fit in VRAM
         "batch_effective_size": 128,
-        "num_epochs": 2,
+        "num_epochs": 3,
         "num_blocks": 24,
         "dropout_rate": 0.1,
         "embed_dim": 1024,
         "context_len": 2048,
         "num_heads": 16,
-        "warmup_steps": 50 # TODO: this is for 200,000 samples, if you augment the dataset adjust it.
+        "warmup_steps": 70 # TODO: this is for 200,000 samples, if you augment the dataset adjust it.
     }
     raise ValueError(f"bad training stage {training_stage}")
 
@@ -279,8 +279,6 @@ def main(training_stage, run_name, pretrained_name, pretrained_checkpoint, resum
         total_steps = steps_per_epoch * C.num_epochs
 
         def lr_lambda(step):
-            min_lr_ratio = C.min_lr / C.learning_rate
-            return min_lr_ratio #TODO: change
             if step < C.warmup_steps:
                 return float(step + 1) / float(max(1, C.warmup_steps))
             t = (step - C.warmup_steps) / float(max(1, total_steps - C.warmup_steps))
